@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, moveNoticeText, noticeToastPlan, openSubagentToast, pathTail, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes } from '../src/client/logic.js'
+import { adjustOverflowLabel, applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, moveNoticeText, noticeToastPlan, openSubagentToast, pathTail, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes } from '../src/client/logic.js'
 
 // ---- dotStateFor：状态点语义 ----------------------------------------------
 // 历史回归：DSH 把 running 报成 ongoing（9766476）；done 在当前行上不能亮绿
@@ -668,3 +668,58 @@ test('filterShapeFromSaved: 脏数据宽容——null/数组/缺字段统统不�
 })
 
 
+
+// ---- adjustOverflowLabel：issue #16「展开其余 N 个」计数虚高 -----------------
+// N 由上游按数据层算，看不到插件 display:none 隐藏的行 → 扣掉组内隐藏数；
+// 扣到 0 时按钮应一并藏起（点开也不会有行出现）。
+test('overflow label subtracts plugin-hidden rows from the upstream count', () => {
+  const zh = adjustOverflowLabel('展开其余 12 个会话', 8)
+  assert.equal(zh.hide, false)
+  assert.equal(zh.base, 12)
+  assert.equal(zh.adjusted, 4)
+  assert.equal(zh.changed, true)
+  assert.equal(zh.text, '展开其余 4 个会话')
+
+  const en = adjustOverflowLabel('Show 12 more sessions', 5)
+  assert.equal(en.text, 'Show 7 more sessions')
+  assert.equal(en.adjusted, 7)
+})
+
+test('overflow label hides the button when every remaining row is plugin-hidden', () => {
+  const exact = adjustOverflowLabel('展开其余 12 个会话', 12)
+  assert.equal(exact.hide, true)
+  assert.equal(exact.adjusted, 0)
+
+  // 组内隐藏数比上游计数还多（数据层与 DOM 的统计口径短暂不一致）也不得出负数。
+  const over = adjustOverflowLabel('展开其余 3 个会话', 13)
+  assert.equal(over.hide, true)
+  assert.equal(over.adjusted, 0)
+})
+
+test('overflow label leaves strings without a count untouched', () => {
+  // 展开态的「收起」没有数字：不能据此隐藏按钮，否则用户收不回去。
+  const collapse = adjustOverflowLabel('收起', 12)
+  assert.equal(collapse.hide, false)
+  assert.equal(collapse.changed, false)
+  assert.equal(collapse.text, '收起')
+  assert.equal(collapse.base, null)
+
+  const empty = adjustOverflowLabel('', 5)
+  assert.equal(empty.hide, false)
+  assert.equal(empty.text, '')
+})
+
+test('overflow label is idempotent for zero hidden and tolerates thousand separators', () => {
+  const none = adjustOverflowLabel('展开其余 12 个会话', 0)
+  assert.equal(none.changed, false)
+  assert.equal(none.text, '展开其余 12 个会话')
+
+  const thousands = adjustOverflowLabel('展开其余 1,200 个会话', 200)
+  assert.equal(thousands.base, 1200)
+  assert.equal(thousands.adjusted, 1000)
+  assert.equal(thousands.text, '展开其余 1000 个会话')
+
+  // 负数/非数字一律按 0 处理，绝不反向加数。
+  assert.equal(adjustOverflowLabel('展开其余 5 个会话', -3).adjusted, 5)
+  assert.equal(adjustOverflowLabel('展开其余 5 个会话', 'abc').adjusted, 5)
+})

@@ -11,7 +11,7 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { applyTagFilter, canDropOnWorkspace, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, noticeToastPlan, openSubagentToast, pathTail, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
+import { adjustOverflowLabel, applyTagFilter, canDropOnWorkspace, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, noticeToastPlan, openSubagentToast, pathTail, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
 
 export const inject = ['slots']
 
@@ -2727,6 +2727,23 @@ function dsmTeardownSidebarAug() {
     try { document.querySelectorAll(sel).forEach((el) => el.remove()) } catch (e) { /* best-effort */ }
   }
   try {
+    // issue #16：被隐藏的会话行与展开按钮在卸载时还原——adapter 停用（上游
+    // 改版）或插件停用后，不能把「看不见的会话」留在官方侧栏上。
+    document.querySelectorAll('[data-dsm-hidden]').forEach((row) => {
+      row.style.display = ''
+      row.removeAttribute('data-dsm-hidden')
+    })
+    document.querySelectorAll('[data-dsm-overflow-hidden], [data-dsm-overflow-base]').forEach((btn) => {
+      // 文案可能被我们扣减过：dataset 里存着上游原文，卸载时连文案一起还原。
+      const base = btn.getAttribute('data-dsm-overflow-base')
+      if (base != null && btn.textContent !== base) btn.textContent = base
+      btn.style.display = ''
+      btn.removeAttribute('data-dsm-overflow-hidden')
+      btn.removeAttribute('data-dsm-overflow-base')
+      btn.removeAttribute('data-dsm-overflow-write')
+    })
+  } catch (e) { /* best-effort */ }
+  try {
     document.querySelectorAll('[data-dsm-group-hidden]').forEach((owner) => {
       owner.style.display = owner.dataset.dsmPrevDisplay || ''
       owner.removeAttribute('data-dsm-group-hidden')
@@ -3060,6 +3077,12 @@ function installSidebarSessionMenuAug() {
 function installSidebarStatusDots() {
   if (typeof document === 'undefined') return
   const DOT = 'data-dsm-dot'
+  // issue #16：被插件隐藏的行打标记；展开计数的扣减统计靠它（数据层不可用时兜底）。
+  const DSM_HIDDEN_ATTR = 'data-dsm-hidden'
+  // 展开按钮的文案基线 / 上次写入值存在 dataset（而非 WeakMap）：HMR / 插件
+  // 重装后新闭包里 WeakMap 是空的，会把「已扣减的文案」再当上游原文扣一次；
+  // dataset 跟随节点存活，卸载时还能据此还原原文案。data-dsm-* 不在
+  // MutationObserver 的 attributeFilter 里，不会自触发重绘。
   if (!document.querySelector('style[data-dsm=aug]')) {
     const s = document.createElement('style')
     s.dataset.dsm = 'aug'
@@ -3124,6 +3147,96 @@ function installSidebarStatusDots() {
       }
     })
   }
+  // issue #16：「展开其余 N 个会话」的 N 是上游按数据层算的（0.2.0-rc.2 叫
+  // collapsedSessionRows，0.2.1-rc.2 改叫 watermarkRows），它看不到插件用
+  // display:none 藏起来的回收站/空白行，于是 N 虚高；点开只是把更多已隐藏行
+  // 塞进 DOM，画面不动，很像「会话丢了」。这里把组内被我们隐藏的条数从文案
+  // 里扣掉，扣到 0 就把按钮一并藏起（再点也不会有行出现）。
+  //
+  // 覆盖范围：只改**文案与显隐**，不碰上游的展开状态机（watermark / 点击
+  // 行为），也不改任何行自身的可见性判定。
+  function dsmSyncOverflowLabels(purgedNow) {
+    let buttons = null
+    try { buttons = document.querySelectorAll('[data-row-key^="overflow:"]') } catch (e) { return }
+    if (!buttons || !buttons.length) return
+    // 组 key → 工作区标题行，供数据层精确统计（一次 paint 只建一次表）。
+    let wsRows = null
+    const wsRowFor = (key) => {
+      if (!wsRows) {
+        wsRows = new Map()
+        try {
+          document.querySelectorAll('[data-row-key^="workspace:"]').forEach((r) => {
+            const k = r.getAttribute('data-row-key')
+            if (k) wsRows.set(k.slice('workspace:'.length), r)
+          })
+        } catch (e) { wsRows = new Map() }
+      }
+      return wsRows.get(key) || null
+    }
+    buttons.forEach((btn) => {
+      const attr = btn.getAttribute('data-row-key') || ''
+      const key = attr.slice('overflow:'.length)
+      // 1) 数据层精确统计：group.sessions 就是上游算 N 用的同一份集合，按 id
+      //    对照「回收站 / 墓碑 / 空白」，扣减数与真实可展开行数一致（不受
+      //    「有多少行已渲染进 DOM」影响）。
+      let hidden = null
+      const wsRow = wsRowFor(key)
+      if (wsRow) {
+        const info = sidebarAdapter.recognize(wsRow)
+        const sessions = info && info.group && Array.isArray(info.group.sessions) ? info.group.sessions : null
+        if (sessions && sessions.length) {
+          hidden = 0
+          for (const node of sessions) {
+            const id = node && node.id != null ? String(node.id) : ''
+            if (!id) continue
+            if ((dsmTrashIds && dsmTrashIds.has(id)) || purgedNow.has(id) || (dsmLineage.get(id) && dsmLineage.get(id).empty)) hidden++
+          }
+        }
+      }
+      // 2) DOM 兜底：只数同组直接子节点里带插件标记的会话行（不跨嵌套分组）。
+      if (hidden === null) {
+        const scope = btn.parentElement
+        if (!scope || !scope.children) return
+        hidden = 0
+        for (const el of scope.children) {
+          if (el === btn || !el.getAttribute) continue
+          if (el.getAttribute('role') !== 'treeitem') continue
+          const k = el.getAttribute('data-row-key') || ''
+          if (!k.startsWith('session:')) continue
+          if (el.hasAttribute(DSM_HIDDEN_ATTR)) hidden++
+        }
+      }
+      const raw = btn.textContent || ''
+      const last = btn.getAttribute('data-dsm-overflow-write')
+      let baseline = btn.getAttribute('data-dsm-overflow-base')
+      // 首次见到，或上游重渲染换了文案（含点击展开后的新 N）→ 以当前文案为新基准。
+      if (baseline == null || raw !== last) {
+        baseline = raw
+        btn.setAttribute('data-dsm-overflow-base', baseline)
+      }
+      const plan = adjustOverflowLabel(baseline, hidden)
+      if (plan.hide) {
+        if (btn.style.display !== 'none') btn.style.display = 'none'
+        if (!btn.hasAttribute('data-dsm-overflow-hidden')) btn.setAttribute('data-dsm-overflow-hidden', '')
+        return
+      }
+      if (btn.hasAttribute('data-dsm-overflow-hidden')) {
+        btn.style.display = ''
+        btn.removeAttribute('data-dsm-overflow-hidden')
+      }
+      if (plan.changed) {
+        // 同值不写：写入会触发 characterData 观察 → 重绘，必须保持幂等。
+        if (btn.textContent !== plan.text) btn.textContent = plan.text
+        btn.setAttribute('data-dsm-overflow-write', plan.text)
+      } else if (raw !== baseline) {
+        // 需要扣减的条数归零 / 文案回到原文：还原上游基准（React 未必替我们重渲染）。
+        btn.textContent = baseline
+        btn.setAttribute('data-dsm-overflow-write', baseline)
+      } else {
+        btn.setAttribute('data-dsm-overflow-write', raw)
+      }
+    })
+  }
   const paint = () => {
     if (sidebarAdapter.disabled) return
     // Recompute the active session on every paint so the active row is never
@@ -3169,6 +3282,10 @@ function installSidebarStatusDots() {
       const purged = purgedNow
       if ((dsmTrashIds && dsmTrashIds.has(id)) || purged.has(id)) {
         if (row.style.display !== 'none') row.style.display = 'none'
+        // issue #16：标记「这一行是插件隐藏的」，供展开计数扣减使用（数据层
+        // 拿不到 group.sessions 时也能按 DOM 兜底统计）。属性不进 observer 的
+        // attributeFilter，不会自触发重绘。
+        if (row.getAttribute(DSM_HIDDEN_ATTR) !== 'trash') row.setAttribute(DSM_HIDDEN_ATTR, 'trash')
         const d = row.querySelector('[' + DOT + ']'); if (d) d.remove()
         dsmDropSubList(row, id)
         return
@@ -3201,11 +3318,15 @@ function installSidebarStatusDots() {
       }
       if (hideLineage) {
         if (row.style.display !== 'none') row.style.display = 'none'
+        if (row.getAttribute(DSM_HIDDEN_ATTR) !== 'empty') row.setAttribute(DSM_HIDDEN_ATTR, 'empty')
         const d = row.querySelector('[' + DOT + ']'); if (d) d.remove()
         dsmDropSubList(row, id)
         return
       }
       if (row.style.display === 'none') row.style.display = ''
+      // 行重新可见（已从回收站恢复 / 空白状态消失）：摘掉隐藏标记，展开计数
+      // 立刻把这一条还回「可展开」的数量里。
+      if (row.hasAttribute(DSM_HIDDEN_ATTR)) row.removeAttribute(DSM_HIDDEN_ATTR)
       if (!isEmpty && li && li.parentSession && li.origin !== 'subagent') {
         // fork 分支行：绿「⑂ 分支」chip，点击滚动并高亮父会话行。
         // v3.6.2 #3：chip 每次 paint 幂等同步（存在才不建，但 tooltip/父 id
@@ -3342,6 +3463,8 @@ function installSidebarStatusDots() {
       dot.style.background = color
     })
     dsmSyncEmptyGroups()
+    // issue #16：等隐藏标记落定后再校准展开计数（数据层优先，DOM 标记兜底）。
+    dsmSyncOverflowLabels(purgedNow)
   }
   dsmRepaintDots = paint
   const paintToast = (msg, kind) => {

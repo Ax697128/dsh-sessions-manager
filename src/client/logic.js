@@ -462,3 +462,33 @@ export function filterShapeFromSaved(item) {
   if (tag === '' && f.tag !== '') degraded.push('tag')
   return { view, workspace, sort, tag, degraded }
 }
+
+// issue #16：侧栏「展开其余 N 个会话」的 N 由上游按**数据层**计算
+// （0.2.0-rc.2 `collapsedSessionRows` → 0.2.1-rc.2 `watermarkRows`），
+// 看不到插件用 display:none 隐藏的回收站/空白行，于是数字虚高；点展开只是
+// 把更多已隐藏行塞进 DOM，可见行数不变——按钮在动、画面不动，容易被误读成
+// 「会话丢了」。这里把「组内被我们隐藏的条数」从文案里的 N 扣掉。
+//
+// 只替换第一个数字（各语言文案都把计数放在数字位，如
+// 「展开其余 12 个会话」/「Show 12 more」），支持千分位写法；文案没有数字
+// （例如展开态「收起」）一律不动。扣到 ≤ 0 时返回 hide：此时再怎么点也不会
+// 有行出现，按钮应当一并藏起。
+export function adjustOverflowLabel(text, hiddenCount = 0) {
+  const raw = typeof text === 'string' ? text : ''
+  const hidden = Math.max(0, Number(hiddenCount) || 0)
+  const m = raw.match(/(\d[\d,]*)/)
+  if (!m) return { text: raw, hide: false, base: null, adjusted: null, changed: false }
+  const base = Number(m[1].replace(/,/g, '')) || 0
+  // 0 不是一个可信的「还有 N 个」——不据此隐藏按钮，避免误判上游改版。
+  if (base <= 0) return { text: raw, hide: false, base, adjusted: base, changed: false }
+  const adjusted = base - hidden
+  if (adjusted <= 0) return { text: raw, hide: true, base, adjusted: 0, changed: false }
+  if (adjusted === base) return { text: raw, hide: false, base, adjusted, changed: false }
+  return {
+    text: raw.slice(0, m.index) + String(adjusted) + raw.slice(m.index + m[1].length),
+    hide: false,
+    base,
+    adjusted,
+    changed: true,
+  }
+}
