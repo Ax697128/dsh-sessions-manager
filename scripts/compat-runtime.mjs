@@ -78,13 +78,28 @@ try {
   // Service registration semantics are exactly the production ones.
   const cordisDir = requireFrom(pkgs.persistence).resolve('@deepseek-ai/cordis')
   const cordis = await import(pathToFileURL(cordisDir).href).then((m) => m.default ?? m)
-  const { default: JsonlSessionPersistence } = await loadModule(pkgs.persistenceJsonl)
+  // 0.2.1-rc.2 起 @deepseek-ai/dsh-session-persistence-jsonl **没有 default 导出**，
+  // 改为导出 cordis 插件（{ name, apply, Config }），由 apply 在子插件里注册
+  // sessionPersistence 服务；≤0.2.0 则默认导出实现类。两种形态都要能起：
+  // 类直接 new，插件走 ctx.plugin + fork.await()。
+  const jsonlMod = await loadModule(pkgs.persistenceJsonl)
+  const jsonlIsPlugin = typeof jsonlMod.apply === 'function' && typeof jsonlMod.name === 'string'
+  const JsonlSessionPersistence = typeof jsonlMod.default === 'function'
+    ? jsonlMod.default
+    : (jsonlIsPlugin ? jsonlMod : null)
+  const bootJsonlPersistence = async (context, config) => {
+    if (typeof JsonlSessionPersistence === 'function') return new JsonlSessionPersistence(context, config)
+    if (!jsonlIsPlugin) throw new Error('session-persistence-jsonl exports neither a class nor a cordis plugin')
+    const fork = context.plugin(JsonlSessionPersistence, config)
+    if (fork && typeof fork.await === 'function') await fork.await()
+    return context.sessionPersistence
+  }
   const persistenceMod = await loadModule(pkgs.persistence)
   const ServiceCtor = persistenceMod.default
-  check('exports resolve', typeof JsonlSessionPersistence === 'function' && typeof ServiceCtor === 'function')
+  check('exports resolve', (typeof JsonlSessionPersistence === 'function' || jsonlIsPlugin) && typeof ServiceCtor === 'function')
 
   const ctx = typeof cordis === 'function' ? new cordis() : new cordis.Context()
-  const sp = new JsonlSessionPersistence(ctx, { root })
+  const sp = await bootJsonlPersistence(ctx, { root })
   check('service is the official SessionPersistence subclass', sp instanceof ServiceCtor, sp.name)
 
   // ---- synthetic session through the official write path -------------------
@@ -463,7 +478,7 @@ try {
       domCtx.plugin(storageMod.default)
       domCtx.plugin(jsonMod, { root: dataDir })
       domCtx.plugin(domainMod, { backend: 'json' })
-      domCtx.plugin(JsonlSessionPersistence, { root: sessRoot })
+      await bootJsonlPersistence(domCtx, { root: sessRoot })
       domCtx.provide('webServer', { register: (route) => { domRoutes.set(route.path, route.handler); return () => {} } })
       domCtx.provide('sessionQuery', {
         readTitleSnapshots: async (ids) => ids.map((id) => ({ status: 'fulfilled', value: { session: { id }, title: { title: `Domain ${id}` } } })),
@@ -650,7 +665,7 @@ try {
     await copyFile(legacyLogPath, join(legacyDir, basename(legacyLogPath)))
     // 独立 cordis Context：sessionPersistence 是按 ctx 注册的服务，不能与主实例共用。
     const legacyCtx = typeof cordis === 'function' ? new cordis() : new cordis.Context()
-    const spLegacy = new JsonlSessionPersistence(legacyCtx, { root: legacyRoot })
+    const spLegacy = await bootJsonlPersistence(legacyCtx, { root: legacyRoot })
     const legacyAdapter = plugin.createPersistenceAdapter(spLegacy)
     const legacyId = String(legacyHeader.id)
 
