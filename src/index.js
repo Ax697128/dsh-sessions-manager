@@ -1729,6 +1729,18 @@ export function apply(ctx) {
     const payload = {
       titles: Object.fromEntries(authorityTitleCache),
       trashedSessionIds: store.items.map((item) => String(item.sessionId)),
+      // issue #16：回收站按 cwd 的条数。折叠分组下上游把 group.sessions 收回成
+      // 空数组，client 拿不到成员 id，只能用「组内会话总数 − 本组回收站条数」
+      // 还原展开按钮该显示的数字；有了这份统计，那次扣减才是准确的而非估算。
+      trashedCountByCwd: (() => {
+        const acc = {}
+        for (const item of store.items) {
+          const cwd = typeof item.cwd === 'string' ? item.cwd : ''
+          if (!cwd) continue
+          acc[cwd] = (acc[cwd] || 0) + 1
+        }
+        return acc
+      })(),
       purgedSessionIds: activeTombstones,
       lineage,
       // v3.6.2：还有预热/退避重试在途 → client 缩短轮询节拍，预热一完成就把
