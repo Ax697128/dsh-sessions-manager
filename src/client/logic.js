@@ -467,28 +467,68 @@ export function filterShapeFromSaved(item) {
 // （0.2.0-rc.2 `collapsedSessionRows` → 0.2.1-rc.2 `watermarkRows`），
 // 看不到插件用 display:none 隐藏的回收站/空白行，于是数字虚高；点展开只是
 // 把更多已隐藏行塞进 DOM，可见行数不变——按钮在动、画面不动，容易被误读成
-// 「会话丢了」。这里把「组内被我们隐藏的条数」从文案里的 N 扣掉。
+// 「会话丢了」。
 //
-// 只替换第一个数字（各语言文案都把计数放在数字位，如
-// 「展开其余 12 个会话」/「Show 12 more」），支持千分位写法；文案没有数字
-// （例如展开态「收起」）一律不动。扣到 ≤ 0 时返回 hide：此时再怎么点也不会
-// 有行出现，按钮应当一并藏起。
-export function adjustOverflowLabel(text, hiddenCount = 0) {
+// 注意**不能**用「N − 本组被插件隐藏的条数」：上游的 N 数是「水位线之外
+// 还没渲染的行」，隐藏数数的是「整组被藏起来的行」，两个口径不重叠——被藏的
+// 行可能就在已渲染窗口内，减它属重复扣减，点开一次就翻负，进而把仍有可见行
+// 的按钮藏掉（上游只有这一个展开入口 → 会话不可达）。
+//
+// 正确口径由 `remainingRows` 给出：还能出现几行 = 本组可见总数 − 已渲染的
+// 可见行数；`overflowPlan` 只负责把它写进文案、并决定是否藏按钮。
+export function remainingRows(visibleTotal, renderedVisible) {
+  // Number(null) === 0：null / undefined 必须当作「不知道」，不能当成 0。
+  if (visibleTotal == null || visibleTotal === '') return null
+  const total = Number(visibleTotal)
+  if (!Number.isFinite(total)) return null
+  const shown = Number(renderedVisible)
+  const shownCount = Number.isFinite(shown) ? Math.max(0, Math.floor(shown)) : 0
+  return Math.max(0, Math.max(0, Math.floor(total)) - shownCount)
+}
+
+// 本组已渲染的可见会话行数。`rows` 是直接子节点里会话行的描述
+// （{ id, pluginHidden }），`visibleIds` 是「上游会列出且插件不会藏」的 id 集合。
+// 插件隐藏的行（回收站 / 空白）与不在集合里的行（空白会话 / 上游过滤口径差异）
+// 都不计入 —— 与 `remainingRows` 的「可见总数」保持同一口径。
+export function countRenderedVisible(rows, visibleIds) {
+  if (!Array.isArray(rows) || !visibleIds || typeof visibleIds.has !== 'function') return 0
+  let n = 0
+  for (const row of rows) {
+    if (!row || row.pluginHidden) continue
+    if (row.id && visibleIds.has(row.id)) n++
+  }
+  return n
+}
+
+// 把「还能出现几行」落到展开按钮上：
+// - `more` 未知（拿不到数据层）→ 一律不动作。DOM 兜底在数学上不成立
+//   （窗口内/外的隐藏数口径不同），宁可不改也不写一个看起来合理却会算错的数；
+// - 文案没有数字（展开态的「收起」、或上游改成纯图标）→ 不改也不藏。无法确认
+//   是不是计数文案时保持沉默；
+// - 只替换第一个数字（各语言文案都把计数放在数字位，如「展开其余 12 个会话」
+//   /「Show 12 more」），支持千分位写法；
+// - `more === 0` 才藏按钮：此时确实一行都不会再出现，留着只会让人反复点。
+export function overflowPlan(text, more) {
   const raw = typeof text === 'string' ? text : ''
-  const hidden = Math.max(0, Number(hiddenCount) || 0)
+  const unknown = more == null || !Number.isFinite(Number(more))
+  const remaining = unknown ? 0 : Math.max(0, Math.floor(Number(more)))
   const m = raw.match(/(\d[\d,]*)/)
-  if (!m) return { text: raw, hide: false, base: null, adjusted: null, changed: false }
-  const base = Number(m[1].replace(/,/g, '')) || 0
-  // 0 不是一个可信的「还有 N 个」——不据此隐藏按钮，避免误判上游改版。
-  if (base <= 0) return { text: raw, hide: false, base, adjusted: base, changed: false }
-  const adjusted = base - hidden
-  if (adjusted <= 0) return { text: raw, hide: true, base, adjusted: 0, changed: false }
-  if (adjusted === base) return { text: raw, hide: false, base, adjusted, changed: false }
+  const base = m ? Number(m[1].replace(/,/g, '')) : null
+  if (base === null || unknown) {
+    return { text: raw, hide: false, base, more: unknown ? null : remaining, changed: false }
+  }
+  if (remaining === 0) {
+    // base<=0 是上游没给出可信计数（理论上不会出现）：不据此隐藏，避免误判。
+    return { text: raw, hide: base > 0, base, more: 0, changed: false }
+  }
+  if (remaining === base) {
+    return { text: raw, hide: false, base, more: remaining, changed: false }
+  }
   return {
-    text: raw.slice(0, m.index) + String(adjusted) + raw.slice(m.index + m[1].length),
+    text: raw.slice(0, m.index) + String(remaining) + raw.slice(m.index + m[1].length),
     hide: false,
     base,
-    adjusted,
+    more: remaining,
     changed: true,
   }
 }

@@ -11,7 +11,7 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { adjustOverflowLabel, applyTagFilter, canDropOnWorkspace, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, noticeToastPlan, openSubagentToast, pathTail, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
+import { applyTagFilter, canDropOnWorkspace, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
 
 export const inject = ['slots']
 
@@ -2734,13 +2734,14 @@ function dsmTeardownSidebarAug() {
       row.removeAttribute('data-dsm-hidden')
     })
     document.querySelectorAll('[data-dsm-overflow-hidden], [data-dsm-overflow-base]').forEach((btn) => {
-      // 文案可能被我们扣减过：dataset 里存着上游原文，卸载时连文案一起还原。
+      // 文案可能被我们改写过：dataset 里存着上游原文，卸载时连文案一起还原。
       const base = btn.getAttribute('data-dsm-overflow-base')
       if (base != null && btn.textContent !== base) btn.textContent = base
       btn.style.display = ''
       btn.removeAttribute('data-dsm-overflow-hidden')
       btn.removeAttribute('data-dsm-overflow-base')
       btn.removeAttribute('data-dsm-overflow-write')
+      btn.removeAttribute('data-dsm-overflow-ver')
     })
   } catch (e) { /* best-effort */ }
   try {
@@ -2787,11 +2788,26 @@ function createSidebarAdapter() {
     }
     return out
   }
+  // 只取 `group` 的静默识别：命中即停，**不参与 miss 预算**。展开计数的
+  // workspace 行识别属非关键路径（拿不到就保持上游原文案），不能让它的落空
+  // 把整套侧栏增强熔断；命中即返也省掉继续上溯整条 fiber 链。
+  const recognizeGroupQuiet = (row) => {
+    if (disabled || !row || typeof row !== 'object') return null
+    let f = findFiber(row)
+    let guard = 0
+    while (f && guard++ < 300) {
+      const props = f.memoizedProps
+      if (props && props.group && typeof props.group === 'object') return props.group
+      f = f.return
+    }
+    return null
+  }
   return {
     version: SIDEBAR_ADAPTER_VERSION,
     get disabled() { return disabled },
     findFiber,
     recognize,
+    recognizeGroupQuiet,
   }
 }
 const sidebarAdapter = createSidebarAdapter()
@@ -3079,6 +3095,17 @@ function installSidebarStatusDots() {
   const DOT = 'data-dsm-dot'
   // issue #16：被插件隐藏的行打标记；展开计数的扣减统计靠它（数据层不可用时兜底）。
   const DSM_HIDDEN_ATTR = 'data-dsm-hidden'
+  // 展开按钮上的数据集：上游原文（基线）、上次写入值、口径版本、是否被我们藏起。
+  const DSM_OVERFLOW_BASE = 'data-dsm-overflow-base'
+  const DSM_OVERFLOW_WRITE = 'data-dsm-overflow-write'
+  const DSM_OVERFLOW_VER = 'data-dsm-overflow-ver'
+  const DSM_OVERFLOW_HIDDEN = 'data-dsm-overflow-hidden'
+  let overflowDebugged = false
+  const debugOverflowOnce = (msg) => {
+    if (overflowDebugged) return
+    overflowDebugged = true
+    try { console.debug('[dsh-sessions-manager] 展开计数：' + msg) } catch (e) { /* 控制台不可用 */ }
+  }
   // 展开按钮的文案基线 / 上次写入值存在 dataset（而非 WeakMap）：HMR / 插件
   // 重装后新闭包里 WeakMap 是空的，会把「已扣减的文案」再当上游原文扣一次；
   // dataset 跟随节点存活，卸载时还能据此还原原文案。data-dsm-* 不在
@@ -3150,92 +3177,155 @@ function installSidebarStatusDots() {
   // issue #16：「展开其余 N 个会话」的 N 是上游按数据层算的（0.2.0-rc.2 叫
   // collapsedSessionRows，0.2.1-rc.2 改叫 watermarkRows），它看不到插件用
   // display:none 藏起来的回收站/空白行，于是 N 虚高；点开只是把更多已隐藏行
-  // 塞进 DOM，画面不动，很像「会话丢了」。这里把组内被我们隐藏的条数从文案
-  // 里扣掉，扣到 0 就把按钮一并藏起（再点也不会有行出现）。
+  // 塞进 DOM，画面不动，很像「会话丢了」。
   //
-  // 覆盖范围：只改**文案与显隐**，不碰上游的展开状态机（watermark / 点击
-  // 行为），也不改任何行自身的可见性判定。
+  // 只改**文案与显隐**，不碰上游的展开状态机（watermark / 点击行为），也不改
+  // 任何行自身的可见性判定。
+  //
+  // 口径（F1）：上游 N 是「水位线之外未渲染的行数」，和「整组被插件藏起来的
+  // 行数」不重叠，相减会重复扣减、点开一次就翻负，把仍有可见行的按钮藏掉
+  // （上游只有这一个展开入口 → 会话不可达）。这里改用
+  //   还能出现几行 = 本组可见总数（非 blank、且不会被插件藏）- 已渲染可见行数
+  // 空白行两边都排除（F2）：上游 watermarkRows 里 `if (session.blank) return true`
+  // —— 空白行永远保留、从不计入 N。
+  //
+  // 数据层拿不到 group.sessions 时**什么都不改**（F6）：DOM 兜底在数学上不成立，
+  // 写一个看起来合理却会算错的数比不改更糟。
+  const OVERFLOW_SIGS = new WeakMap()
+  // 签名只看「便宜且能反映变化」的量：本组已渲染可见会话行（数量 + 首尾 id）、
+  // 按钮自身文案与显隐、三个集合的大小。流式输出时 paint 每帧都跑，但侧栏结构
+  // 绝大多数帧没变 —— 命中签名就直接跳过 fiber 走链（F4）。
+  const overflowSignature = (scope, btn, purgedNow) => {
+    let n = 0
+    let firstKey = ''
+    let lastKey = ''
+    for (const el of scope.children) {
+      if (el === btn || !el.getAttribute) continue
+      const k = el.getAttribute('data-row-key') || ''
+      if (!k.startsWith('session:')) continue
+      if (el.hasAttribute(DSM_HIDDEN_ATTR)) continue
+      n++
+      if (!firstKey) firstKey = k
+      lastKey = k
+    }
+    return n + '|' + firstKey + '|' + lastKey + '|' + (btn.textContent || '') + '|' + (btn.style.display || '') +
+      '|' + (dsmTrashIds ? dsmTrashIds.size : -1) + '|' + purgedNow.size + '|' + dsmLineage.size
+  }
   function dsmSyncOverflowLabels(purgedNow) {
     let buttons = null
     try { buttons = document.querySelectorAll('[data-row-key^="overflow:"]') } catch (e) { return }
     if (!buttons || !buttons.length) return
-    // 组 key → 工作区标题行，供数据层精确统计（一次 paint 只建一次表）。
-    let wsRows = null
-    const wsRowFor = (key) => {
-      if (!wsRows) {
-        wsRows = new Map()
-        try {
-          document.querySelectorAll('[data-row-key^="workspace:"]').forEach((r) => {
-            const k = r.getAttribute('data-row-key')
-            if (k) wsRows.set(k.slice('workspace:'.length), r)
-          })
-        } catch (e) { wsRows = new Map() }
-      }
-      return wsRows.get(key) || null
-    }
-    buttons.forEach((btn) => {
-      const attr = btn.getAttribute('data-row-key') || ''
-      const key = attr.slice('overflow:'.length)
-      // 1) 数据层精确统计：group.sessions 就是上游算 N 用的同一份集合，按 id
-      //    对照「回收站 / 墓碑 / 空白」，扣减数与真实可展开行数一致（不受
-      //    「有多少行已渲染进 DOM」影响）。
-      let hidden = null
-      const wsRow = wsRowFor(key)
-      if (wsRow) {
-        const info = sidebarAdapter.recognize(wsRow)
-        const sessions = info && info.group && Array.isArray(info.group.sessions) ? info.group.sessions : null
-        if (sessions && sessions.length) {
-          hidden = 0
-          for (const node of sessions) {
-            const id = node && node.id != null ? String(node.id) : ''
-            if (!id) continue
-            if ((dsmTrashIds && dsmTrashIds.has(id)) || purgedNow.has(id) || (dsmLineage.get(id) && dsmLineage.get(id).empty)) hidden++
-          }
-        }
-      }
-      // 2) DOM 兜底：只数同组直接子节点里带插件标记的会话行（不跨嵌套分组）。
-      if (hidden === null) {
+    try {
+      buttons.forEach((btn) => {
+        // 工作区标题行与本组的会话行同属一个 groupSection（上游 renderGroup 的
+        // 直接子节点；子分组在另一个 role=group 容器里）→ 只按直接子节点找，
+        // 不再做全文档属性前缀扫描。
         const scope = btn.parentElement
         if (!scope || !scope.children) return
-        hidden = 0
+        const sig = overflowSignature(scope, btn, purgedNow)
+        if (OVERFLOW_SIGS.get(btn) === sig) return
+        const key = (btn.getAttribute('data-row-key') || '').slice('overflow:'.length)
+        let wsRow = null
+        for (const el of scope.children) {
+          if (el.getAttribute && el.getAttribute('data-row-key') === 'workspace:' + key) { wsRow = el; break }
+        }
+        const group = wsRow ? sidebarAdapter.recognizeGroupQuiet(wsRow) : null
+        const nodes = group && Array.isArray(group.sessions) ? group.sessions : null
+        if (!nodes) {
+          // 数据层不可用：还原成上游原文案并放开按钮，绝不猜数字。
+          restoreOverflowButton(btn)
+          OVERFLOW_SIGS.set(btn, overflowSignature(scope, btn, purgedNow))
+          return
+        }
+        // 本组「上游会列出、且不会被插件藏起来」的会话集合。
+        const ids = new Set()
+        for (const node of nodes) {
+          if (!node || node.blank) continue
+          const id = node.id != null ? String(node.id) : ''
+          if (!id) continue
+          if ((dsmTrashIds && dsmTrashIds.has(id)) || purgedNow.has(id)) continue
+          const li = dsmLineage.get(id)
+          if (li && li.empty) continue
+          ids.add(id)
+        }
+        // 已渲染进 DOM 的可见行：只认本组直接子节点里不在隐藏标记中的会话行。
+        // 用 `data-dsm-hidden` 而非 style.display 判定——上游折叠父级时行自身
+        // 的 display 仍是空串，按 style 判会把看不见的行算成已渲染。
+        const rendered = []
         for (const el of scope.children) {
           if (el === btn || !el.getAttribute) continue
           if (el.getAttribute('role') !== 'treeitem') continue
           const k = el.getAttribute('data-row-key') || ''
           if (!k.startsWith('session:')) continue
-          if (el.hasAttribute(DSM_HIDDEN_ATTR)) hidden++
+          rendered.push({ id: k.slice('session:'.length), pluginHidden: el.hasAttribute(DSM_HIDDEN_ATTR) })
         }
-      }
-      const raw = btn.textContent || ''
-      const last = btn.getAttribute('data-dsm-overflow-write')
-      let baseline = btn.getAttribute('data-dsm-overflow-base')
-      // 首次见到，或上游重渲染换了文案（含点击展开后的新 N）→ 以当前文案为新基准。
-      if (baseline == null || raw !== last) {
-        baseline = raw
-        btn.setAttribute('data-dsm-overflow-base', baseline)
-      }
-      const plan = adjustOverflowLabel(baseline, hidden)
-      if (plan.hide) {
-        if (btn.style.display !== 'none') btn.style.display = 'none'
-        if (!btn.hasAttribute('data-dsm-overflow-hidden')) btn.setAttribute('data-dsm-overflow-hidden', '')
-        return
-      }
-      if (btn.hasAttribute('data-dsm-overflow-hidden')) {
-        btn.style.display = ''
-        btn.removeAttribute('data-dsm-overflow-hidden')
-      }
-      if (plan.changed) {
-        // 同值不写：写入会触发 characterData 观察 → 重绘，必须保持幂等。
-        if (btn.textContent !== plan.text) btn.textContent = plan.text
-        btn.setAttribute('data-dsm-overflow-write', plan.text)
-      } else if (raw !== baseline) {
-        // 需要扣减的条数归零 / 文案回到原文：还原上游基准（React 未必替我们重渲染）。
-        btn.textContent = baseline
-        btn.setAttribute('data-dsm-overflow-write', baseline)
-      } else {
-        btn.setAttribute('data-dsm-overflow-write', raw)
-      }
-    })
+        // 空集/口径不匹配的保护：数据层说「一条都没有」但 DOM 里明明有会话行，
+        // 说明 group.sessions 的语义变了（懒加载、上游又换了过滤条件）。此时按
+        // 未知处理，绝不能算出 0 把按钮藏掉 —— 那是把可见会话变成不可达。
+        if (!nodes.length || (!ids.size && rendered.length)) {
+          restoreOverflowButton(btn)
+          OVERFLOW_SIGS.set(btn, overflowSignature(scope, btn, purgedNow))
+          return
+        }
+        const renderedVisible = countRenderedVisible(rendered, ids)
+        const more = remainingRows(ids.size, renderedVisible)
+        applyOverflowPlan(btn, more, '可见 ' + ids.size + ' / 已渲染 ' + renderedVisible)
+        OVERFLOW_SIGS.set(btn, overflowSignature(scope, btn, purgedNow))
+      })
+    } catch (e) {
+      // 非关键路径：失败就保持上游原样，不影响本次 paint 的其它注入（F5）。
+      try { console.debug('[dsh-sessions-manager] 展开计数校准跳过：' + (e && e.message)) } catch (e2) {}
+    }
+  }
+  // 把计划落到按钮上：文案基线 / 上次写入值 / 口径版本都记在 dataset
+  // （F8：跨版本残留的旧基线不会延续到下个版本），HMR 重装后也不会二次处理。
+  function applyOverflowPlan(btn, more, detail) {
+    const raw = btn.textContent || ''
+    const ver = String(SIDEBAR_ADAPTER_VERSION)
+    const fresh = btn.getAttribute(DSM_OVERFLOW_VER) === ver
+    const last = fresh ? btn.getAttribute(DSM_OVERFLOW_WRITE) : null
+    let baseline = fresh ? btn.getAttribute(DSM_OVERFLOW_BASE) : null
+    // 首次见到，或上游重渲染换了文案（含点击展开后的新 N）→ 以当前文案为新基准。
+    if (baseline == null || raw !== last) baseline = raw
+    btn.setAttribute(DSM_OVERFLOW_BASE, baseline)
+    btn.setAttribute(DSM_OVERFLOW_VER, ver)
+    // F3：上游 N 藏在基线文案里。若我们算出的「还能出现几行」反而比上游 N 大，
+    // 说明数据层与 DOM 的口径已经不一致（上游改了 group.sessions 的过滤语义、
+    // 或将来插件改用官方归档 API）——收敛回上游 N 并留一条 debug，把「静默
+    // 失效」变成可观测。注意必须用**基线**里的 N：当前文案可能是我们写过的值。
+    const bm = baseline.match(/(\d[\d,]*)/)
+    const upstream = bm ? Number(bm[1].replace(/,/g, '')) : null
+    if (more != null && upstream != null && upstream > 0 && more > upstream) {
+      more = upstream
+      debugOverflowOnce((detail || '') + '，超过上游计数 ' + upstream + '，已按上游计数收敛')
+    }
+    const plan = overflowPlan(baseline, more)
+    if (plan.hide) {
+      if (btn.style.display !== 'none') btn.style.display = 'none'
+      if (!btn.hasAttribute(DSM_OVERFLOW_HIDDEN)) btn.setAttribute(DSM_OVERFLOW_HIDDEN, '')
+      btn.setAttribute(DSM_OVERFLOW_WRITE, baseline)
+      return
+    }
+    if (btn.hasAttribute(DSM_OVERFLOW_HIDDEN)) {
+      btn.style.display = ''
+      btn.removeAttribute(DSM_OVERFLOW_HIDDEN)
+    }
+    if (plan.changed) {
+      // 同值不写：写入会触发 characterData 观察 → 重绘，必须保持幂等。
+      if (btn.textContent !== plan.text) btn.textContent = plan.text
+      btn.setAttribute(DSM_OVERFLOW_WRITE, plan.text)
+    } else {
+      if (btn.textContent !== baseline) btn.textContent = baseline
+      btn.setAttribute(DSM_OVERFLOW_WRITE, baseline)
+    }
+  }
+  function restoreOverflowButton(btn) {
+    const verbatim = btn.getAttribute(DSM_OVERFLOW_BASE)
+    if (verbatim != null && btn.textContent !== verbatim) btn.textContent = verbatim
+    if (btn.hasAttribute(DSM_OVERFLOW_HIDDEN)) {
+      btn.style.display = ''
+      btn.removeAttribute(DSM_OVERFLOW_HIDDEN)
+    }
   }
   const paint = () => {
     if (sidebarAdapter.disabled) return
