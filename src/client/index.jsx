@@ -11,7 +11,7 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { applyTagFilter, canDropOnWorkspace, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
+import { aliveSessionCount, applyTagFilter, canDropOnWorkspace, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
 
 export const inject = ['slots']
 
@@ -3095,6 +3095,8 @@ function installSidebarStatusDots() {
   const DOT = 'data-dsm-dot'
   // issue #16：被插件隐藏的行打标记；展开计数的扣减统计靠它（数据层不可用时兜底）。
   const DSM_HIDDEN_ATTR = 'data-dsm-hidden'
+  // 空分组：整组被我们藏起时打在**分组容器**上的标记（见 dsmSyncEmptyGroups）。
+  const GROUP_UNIT_ATTR = 'data-dsm-group-hidden'
   // 展开按钮上的数据集：上游原文（基线）、上次写入值、口径版本、是否被我们藏起。
   const DSM_OVERFLOW_BASE = 'data-dsm-overflow-base'
   const DSM_OVERFLOW_WRITE = 'data-dsm-overflow-write'
@@ -3143,35 +3145,95 @@ function installSidebarStatusDots() {
   // 行；官方（重命名等）改写文本后所有权移交，绝不覆盖 DSH Core 的实时更新。
   const titleBaselines = new WeakMap()
   // 空分组兜底：DSH 会把「日志已不在原处」的会话重新归到「未分组」组里（删
-  // 除后最明显）。我们把行隐藏了，但空组标题会留下来——所以组内所有行都被
-  // 隐藏时，把整个分组（含它的标题行）一起隐藏；组内重新出现可见行时自动
-  // 还原。只在「组内确实有行」时才判定，避免把正在加载的空组误藏。
-  // 原 display 记在 owner 的 dataset 上（见下方 dsmSyncEmptyGroups）。
-  function dsmSyncEmptyGroups() {
-    let groups = null
-    try { groups = document.querySelectorAll('[role="group"]') } catch (e) { return }
-    if (!groups || !groups.length) return
-    groups.forEach((g) => {
-      const items = g.querySelectorAll('[role="treeitem"]')
-      if (!items.length) return
-      let visible = 0
-      items.forEach((it) => { if (it.style.display !== 'none') visible++ })
-      // ARIA tree：group 通常嵌在它的标题 treeitem 里，藏标题即藏整组。
-      // 原 display 存进 dataset（而非 WeakMap）：清场/还原函数无法遍历
-      // WeakMap，dataset 让「谁被我们藏过、原来是什么」随时可查可还原。
-      const owner = g.closest('[role="treeitem"]') || g
-      if (visible === 0) {
-        if (!owner.hasAttribute('data-dsm-group-hidden')) {
-          owner.dataset.dsmPrevDisplay = owner.style.display || ''
-          owner.setAttribute('data-dsm-group-hidden', '')
-        }
-        if (owner.style.display !== 'none') owner.style.display = 'none'
-      } else if (owner.hasAttribute('data-dsm-group-hidden')) {
-        const prev = owner.dataset.dsmPrevDisplay || ''
-        if (owner.style.display !== prev) owner.style.display = prev
-        owner.removeAttribute('data-dsm-group-hidden')
-        delete owner.dataset.dsmPrevDisplay
+  // 除后最明显）。我们把行隐藏了，但空组标题会留下来——所以组内没有**可能
+  // 出现**的会话时，把整个分组容器一起隐藏；重新出现时自动还原。
+  //
+  // 容器定位：各版本的顶层分组容器都没有稳定的 role/class —— `role="group"`
+  // 从 0.1.7 到 0.2.1 只出现在**子分组**容器上（一个包着整段子分组的 div），
+  // 顶层分组是无 role 的普通 div（`groupSection`）。所以以
+  // `data-row-key="workspace:*"`（0.1.7 起稳定）为锚点，取它的父元素当容器：
+  // 本组的会话行与展开按钮都是这个容器的子节点。
+  //
+  // 判定走数据层（与展开计数同一口径）：只有 group.sessions 里「非空白、且
+  // 不在回收站/墓碑/空白集合」的条数确实为 0 才藏。只看 DOM 会把「上游折叠
+  // 后还没渲染出来的可见会话」误判成空组，连标题带展开按钮一起藏掉——那些
+  // 会话就再也点不到了。
+  //
+  // 原 display 记在容器的 dataset 上（而不是 WeakMap）：还原路径无法遍历
+  // WeakMap，dataset 让「谁被我们藏过、原来是什么」随时可查可还原。
+  const setGroupHidden = (scope, hidden) => {
+    if (hidden) {
+      if (!scope.hasAttribute(GROUP_UNIT_ATTR)) {
+        scope.dataset.dsmPrevDisplay = scope.style.display || ''
+        scope.setAttribute(GROUP_UNIT_ATTR, '')
       }
+      if (scope.style.display !== 'none') scope.style.display = 'none'
+      return
+    }
+    if (!scope.hasAttribute(GROUP_UNIT_ATTR)) return
+    const prev = scope.dataset.dsmPrevDisplay || ''
+    if (scope.style.display !== prev) scope.style.display = prev
+    scope.removeAttribute(GROUP_UNIT_ATTR)
+    delete scope.dataset.dsmPrevDisplay
+  }
+  // 元素自身到 stopAt（不含）之间有没有被藏起来。只看我们自己的两处标记与
+  // style.display：不碰 getComputedStyle（每帧调用的代价太高）。
+  const isShownWithin = (el, stopAt) => {
+    let node = el
+    while (node && node !== stopAt) {
+      if (node.style && node.style.display === 'none') return false
+      if (node.hasAttribute && (node.hasAttribute(GROUP_UNIT_ATTR) || node.hasAttribute(DSM_HIDDEN_ATTR))) return false
+      node = node.parentElement
+    }
+    return true
+  }
+  function dsmSyncEmptyGroups(purgedNow) {
+    let rows = null
+    try { rows = document.querySelectorAll('[role="treeitem"][data-row-key^="workspace:"]') } catch (e) { return }
+    if (!rows || !rows.length) return
+    const purged = purgedNow instanceof Set ? purgedNow : new Set()
+    // 被插件藏起来的 id 集合只在真的需要判定时建一次（绝大多数帧用不到）。
+    let hiddenIds = null
+    const hiddenIdSet = () => {
+      if (hiddenIds) return hiddenIds
+      hiddenIds = new Set()
+      if (dsmTrashIds) for (const id of dsmTrashIds) hiddenIds.add(id)
+      for (const id of purged) hiddenIds.add(id)
+      for (const [id, info] of dsmLineage.entries()) if (info && info.empty) hiddenIds.add(id)
+      return hiddenIds
+    }
+    rows.forEach((row) => {
+      try {
+        const scope = row.parentElement
+        if (!scope || scope === document.body) return
+        // 容器必须是无 role 的普通元素（顶层分组）。子分组容器 role="group"
+        // 里装的是整段子分组，不能当组容器用——拿它当容器会把整段子分组藏掉。
+        if (typeof scope.getAttribute !== 'function' || scope.getAttribute('role')) return
+        // 组内还有没被我们藏起来的会话行 → 绝不藏（也顺手还原）。
+        let rendered = 0
+        for (const el of scope.children) {
+          if (el === row || !el.getAttribute) continue
+          if (el.getAttribute('role') !== 'treeitem') continue
+          if (!(el.getAttribute('data-row-key') || '').startsWith('session:')) continue
+          if (el.hasAttribute(DSM_HIDDEN_ATTR)) continue
+          rendered++
+        }
+        if (rendered > 0) { setGroupHidden(scope, false); return }
+        // 容器里可能还挂着子分组（上游把嵌套工作区渲染在 role="group" 的
+        // div 里）。只要还有子分组对用户可见，就绝不能藏父容器——那会把整
+        // 段子分组一起带走。
+        for (const nested of scope.querySelectorAll('[data-row-key^="workspace:"]')) {
+          if (nested === row) continue
+          if (!isShownWithin(nested, scope)) continue
+          setGroupHidden(scope, false)
+          return
+        }
+        // 渲染行全被我们藏了（或一行都没渲染）：只有数据层能证明「真空」才藏。
+        // 拿不到 group.sessions / 数组为空 = 不知道 → 按非空处理，保持显示。
+        const group = sidebarAdapter.recognizeGroupQuiet(row)
+        const sessions = group && Array.isArray(group.sessions) ? group.sessions : null
+        setGroupHidden(scope, aliveSessionCount(sessions, hiddenIdSet()) === 0)
+      } catch (e) { /* 单组失败不影响其它组 */ }
     })
   }
   // issue #16：「展开其余 N 个会话」的 N 是上游按数据层算的（0.2.0-rc.2 叫
@@ -3552,7 +3614,7 @@ function installSidebarStatusDots() {
       }
       dot.style.background = color
     })
-    dsmSyncEmptyGroups()
+    dsmSyncEmptyGroups(purgedNow)
     // issue #16：等隐藏标记落定后再校准展开计数（数据层优先，DOM 标记兜底）。
     dsmSyncOverflowLabels(purgedNow)
   }

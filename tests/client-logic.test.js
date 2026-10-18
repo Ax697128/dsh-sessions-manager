@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, moveNoticeText, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes } from '../src/client/logic.js'
+import { aliveSessionCount, applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, moveNoticeText, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes } from '../src/client/logic.js'
 
 // ---- dotStateFor：状态点语义 ----------------------------------------------
 // 历史回归：DSH 把 running 报成 ongoing（9766476）；done 在当前行上不能亮绿
@@ -774,4 +774,37 @@ test('overflow plan tolerates thousand separators and never counts backwards', (
   // 负数一律按 0（= 没有可展开的）处理，绝不反向加数。
   assert.equal(overflowPlan('展开其余 5 个会话', -3).more, 0)
   assert.equal(overflowPlan('展开其余 5 个会话', 'abc').more, null)
+})
+
+// ---- aliveSessionCount：空分组判定（0.1.7+ 顶层分组无 role，靠工作区行定位）---
+// 只有数据层能证明「组内一条都留不下」时，才允许把分组标题一起藏掉。
+test('alive count ignores blank sessions and every plugin-hidden id', () => {
+  const sessions = [
+    { id: 'a' },            // 正常可见
+    { id: 'b', blank: true }, // 空白会话：上游从不计入可展开数
+    { id: 'c' },            // 回收站
+    { id: 'd' },            // 已彻底删除
+    { id: 'e' },            // 空白血缘
+    { id: 'f' },            // 正常可见
+  ]
+  const hidden = new Set(['c', 'd', 'e'])
+  assert.equal(aliveSessionCount(sessions, hidden), 2)
+})
+
+test('alive count is zero only when nothing can ever reappear', () => {
+  const hidden = new Set(['c', 'd'])
+  assert.equal(aliveSessionCount([{ id: 'c' }, { id: 'd' }], hidden), 0)
+  // 只剩空白会话 = 组里没有可显示的内容（插件一律隐藏空白行）。
+  assert.equal(aliveSessionCount([{ id: 'x', blank: true }], hidden), 0)
+})
+
+test('alive count reports unknown instead of empty for missing or empty data', () => {
+  // 拿不到数据层 / 组还没加载出会话：一律按「不知道」处理，调用方据此保持
+  // 显示——宁可留一个空标题，也不能把还有会话的组藏掉（会话会不可达）。
+  assert.equal(aliveSessionCount(null, new Set()), null)
+  assert.equal(aliveSessionCount(undefined, new Set()), null)
+  assert.equal(aliveSessionCount([], new Set()), null)
+  assert.equal(aliveSessionCount('nope', new Set()), null)
+  // 没有一条带 id（结构不认识）→ 同样是「不知道」，不是「组空」。
+  assert.equal(aliveSessionCount([{ id: null }, { nope: 1 }], new Set()), null)
 })

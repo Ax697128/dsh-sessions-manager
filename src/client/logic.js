@@ -500,6 +500,29 @@ export function countRenderedVisible(rows, visibleIds) {
   return n
 }
 
+// 空分组判定：`group.sessions` 里「还会出现在侧栏」的条数。
+// - 空白会话不计：上游 `watermarkRows` 里 `if (session.blank) return true`，
+//   空白行永远保留、从不计入可展开数；插件也一律把它藏起来。
+// - `hiddenIds` = 回收站 / 墓碑 / 空白血缘的行 id（与展开计数同一份口径）。
+// - 返回 null 表示**不知道**（拿不到数据层，或该组还没加载出会话）：调用方
+//   必须按「非空」处理——宁可留一个空标题，也不能把仍有会话的组藏掉。
+export function aliveSessionCount(sessions, hiddenIds) {
+  if (!Array.isArray(sessions) || !sessions.length) return null
+  let alive = 0
+  let seen = 0
+  for (const node of sessions) {
+    if (!node || node.id == null) continue
+    const id = String(node.id)
+    if (!id) continue
+    seen++
+    if (node.blank) continue
+    if (hiddenIds && typeof hiddenIds.has === 'function' && hiddenIds.has(id)) continue
+    alive++
+  }
+  // 一条带 id 的都没有 = 结构不认识（不是「组空」），照未知处理。
+  return seen === 0 ? null : alive
+}
+
 // 把「还能出现几行」落到展开按钮上：
 // - `more` 未知（拿不到数据层）→ 一律不动作。DOM 兜底在数学上不成立
 //   （窗口内/外的隐藏数口径不同），宁可不改也不写一个看起来合理却会算错的数；
