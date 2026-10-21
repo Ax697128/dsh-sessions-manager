@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { aliveSessionCount, applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, moveNoticeText, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes } from '../src/client/logic.js'
+import { aliveSessionCount, applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, moveNoticeText, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes } from '../src/client/logic.js'
 
 // ---- dotStateFor：状态点语义 ----------------------------------------------
 // 历史回归：DSH 把 running 报成 ongoing（9766476）；done 在当前行上不能亮绿
@@ -699,6 +699,22 @@ test('remaining rows never go negative when the group hides most of its rows', (
   // 旧口径「N − 整组隐藏数」= 12 − 13 = −1，会把按钮藏掉、会话不可达：
   // 新口径在同样的数据下必须是正数（按钮保留）。
   assert.ok(remainingRows(visibleTotal, before) > 0)
+})
+
+test('collapsed groups derive their tally from sessionCount minus that workspace trash', () => {
+  // 折叠态上游把 group.sessions 收回成空数组 —— 而这正是展开按钮出现的时刻。
+  // 旧实现在这里走「空集保护」直接 return，展开计数永远得不到校准（#16 的
+  // 「点开没反应 / 数字不动」）。折叠态改用 sessionCount − 本工作区回收站条数。
+  assert.equal(collapsedVisibleTotal(24, 13), 11)
+  assert.equal(collapsedVisibleTotal(7, 4), 3)
+  // 回收站比组内总数还多（数据短暂不一致）：夹到 0，不写负数。
+  assert.equal(collapsedVisibleTotal(3, 9), 0)
+  // 一个都没进回收站 → 总数原样。
+  assert.equal(collapsedVisibleTotal(5, 0), 5)
+  // 拿不到任一侧就返回 null，调用方据此保持上游原文案，绝不猜数字。
+  assert.equal(collapsedVisibleTotal(null, 3), null)
+  assert.equal(collapsedVisibleTotal(5, null), null)
+  assert.equal(collapsedVisibleTotal(NaN, 3), null)
 })
 
 test('rendered visible rows share the same vocabulary as the visible total', () => {

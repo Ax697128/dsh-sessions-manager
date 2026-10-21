@@ -11,7 +11,7 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { aliveSessionCount, applyTagFilter, canDropOnWorkspace, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
+import { aliveSessionCount, applyTagFilter, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
 
 export const inject = ['slots']
 
@@ -2588,6 +2588,9 @@ function dsmToggleManual(id) {
 // up under DSH's "未分组" group. Loaded from the backend on a throttle and
 // updated optimistically when our own ⋯-menu deletes a session.
 let dsmTrashIds = null
+// issue #16：回收站按 cwd 的条数（host 随 sidebar-state 下发）。折叠分组下
+// 上游把 group.sessions 收回成空数组，展开计数只能靠它来扣掉插件会隐藏的行。
+let dsmTrashCountByCwd = null
 let dsmServerPurgedIds = new Set()
 let dsmAuthoritativeTitles = new Map()
 let dsmTrashTick = 0
@@ -2648,6 +2651,11 @@ async function dsmLoadTrashIds() {
   try {
     const r = await postJSON('/archived-sessions/sidebar-state', {})
     dsmTrashIds = new Set(((r && r.trashedSessionIds) || []).map(String))
+    // issue #16：折叠分组的展开计数要用「组内总数 − 本组回收站条数」，
+    // 这份按 cwd 的统计由 host 计算后随同一响应下发（老 host 没有该字段 → null）。
+    dsmTrashCountByCwd = r && r.trashedCountByCwd && typeof r.trashedCountByCwd === 'object'
+      ? new Map(Object.entries(r.trashedCountByCwd).map(([k, v]) => [String(k), Number(v) || 0]))
+      : null
     dsmServerPurgedIds = new Set(((r && r.purgedSessionIds) || []).map(String))
     // 服务器已确认的乐观标记随即清除；未被确认的标记最多存活到下次刷新，
     // 绝不永久压住后来同 id 的新会话。
@@ -3187,6 +3195,58 @@ function installSidebarStatusDots() {
     }
     return true
   }
+  // issue #16 补丁：本组「会话行」的收集器。
+  //
+  // 原先各处一律按 `scope.children` 找会话行，隐含假设「上游把 `[role=treeitem]`
+  // 直接放在分组容器下」。在 0.2.1-rc.2 的侧栏里这个假设不成立：上游把每个会话行
+  // 包进一层 `<span class="_root_*">` 再放进 `groupSection`，于是 `children` 拿到
+  // 的全是 SPAN（没有 role、没有 data-row-key）。
+  //
+  // 后果不是「少算几个数」，而是整段校准被短路：`rendered` 恒为空 → 命中
+  // 「DOM 里没有会话行」的保护分支直接 return → 按钮上的 data-dsm-* 一个都不写、
+  // 计数永远不校准。用户看到的就是「点了展开没反应」或数字与实际不符。
+  //
+  // 因此改为：先按直接子节点找；一个都没找到时，再向下找（wrapper），
+  // 仍要求命中 `[role=treeitem][data-row-key^="session:"]`，且不跨越嵌套子分组。
+  const groupSessionRows = (scope, btn) => {
+    const out = []
+    if (!scope || !scope.children) return out
+    for (const el of scope.children) {
+      if (el === btn || !el.getAttribute) continue
+      const k = el.getAttribute('data-row-key') || ''
+      if (el.getAttribute('role') === 'treeitem' && k.startsWith('session:')) out.push(el)
+    }
+    if (out.length) return out
+    // wrapper 结构兜底：只在「直接子节点没有会话行」时启用，避免与上一种形态重复计数。
+    let rows = null
+    try {
+      rows = scope.querySelectorAll('[role="treeitem"][data-row-key^="session:"]')
+    } catch (e) { return out }
+    for (const el of rows) {
+      // 跳过属于嵌套子分组的行：它最近的分组容器不是本 scope。
+      let owner = el.parentElement
+      let ok = true
+      while (owner && owner !== scope) {
+        if (owner.getAttribute && owner.getAttribute('role') === 'group') { ok = false; break }
+        owner = owner.parentElement
+      }
+      if (ok) out.push(el)
+    }
+    return out
+  }
+  // 分组容器定位：从工作区标题行向上找「无 role 的普通容器」（顶层分组的
+  // groupSection）。上游可能把标题行包在 wrapper span 里，因此不能只取
+  // parentElement —— 那会拿到 SPAN，使空分组判定整段失效。
+  const groupContainerOf = (row) => {
+    let el = row ? row.parentElement : null
+    for (let depth = 0; el && depth < 4; depth++) {
+      if (typeof el.getAttribute !== 'function') return null
+      // role="group" 是子分组容器，role="tree" 是列表根，都不能当顶层组容器。
+      if (!el.getAttribute('role')) return el
+      el = el.parentElement
+    }
+    return null
+  }
   function dsmSyncEmptyGroups(purgedNow) {
     let rows = null
     try { rows = document.querySelectorAll('[role="treeitem"][data-row-key^="workspace:"]') } catch (e) { return }
@@ -3204,17 +3264,17 @@ function installSidebarStatusDots() {
     }
     rows.forEach((row) => {
       try {
-        const scope = row.parentElement
-        if (!scope || scope === document.body) return
         // 容器必须是无 role 的普通元素（顶层分组）。子分组容器 role="group"
         // 里装的是整段子分组，不能当组容器用——拿它当容器会把整段子分组藏掉。
-        if (typeof scope.getAttribute !== 'function' || scope.getAttribute('role')) return
+        // 上游把标题行包在 wrapper span 里时 parentElement 不是组容器，
+        // 因此向上找到真正的 groupSection（见 groupContainerOf）。
+        const scope = groupContainerOf(row)
+        if (!scope || scope === document.body) return
         // 组内还有没被我们藏起来的会话行 → 绝不藏（也顺手还原）。
+        // 行可能被上游包在 wrapper span 里（见 groupSessionRows 的说明），
+        // 因此用收集器而不是直接遍历 scope.children。
         let rendered = 0
-        for (const el of scope.children) {
-          if (el === row || !el.getAttribute) continue
-          if (el.getAttribute('role') !== 'treeitem') continue
-          if (!(el.getAttribute('data-row-key') || '').startsWith('session:')) continue
+        for (const el of groupSessionRows(scope, row)) {
           if (el.hasAttribute(DSM_HIDDEN_ATTR)) continue
           rendered++
         }
@@ -3261,12 +3321,10 @@ function installSidebarStatusDots() {
     let n = 0
     let firstKey = ''
     let lastKey = ''
-    for (const el of scope.children) {
-      if (el === btn || !el.getAttribute) continue
-      const k = el.getAttribute('data-row-key') || ''
-      if (!k.startsWith('session:')) continue
+    for (const el of groupSessionRows(scope, btn)) {
       if (el.hasAttribute(DSM_HIDDEN_ATTR)) continue
       n++
+      const k = el.getAttribute('data-row-key') || ''
       if (!firstKey) firstKey = k
       lastKey = k
     }
@@ -3287,9 +3345,17 @@ function installSidebarStatusDots() {
         const sig = overflowSignature(scope, btn, purgedNow)
         if (OVERFLOW_SIGS.get(btn) === sig) return
         const key = (btn.getAttribute('data-row-key') || '').slice('overflow:'.length)
+        // 工作区标题行：先按直接子节点找；上游 0.2.1-rc.2 把它也包进 wrapper 时
+        // 再向下找一层（与 groupSessionRows 同一套兜底思路）。
+        const wsKey = 'workspace:' + key
         let wsRow = null
         for (const el of scope.children) {
-          if (el.getAttribute && el.getAttribute('data-row-key') === 'workspace:' + key) { wsRow = el; break }
+          if (el.getAttribute && el.getAttribute('data-row-key') === wsKey) { wsRow = el; break }
+        }
+        if (!wsRow) {
+          try {
+            wsRow = scope.querySelector('[data-row-key="' + wsKey.replace(/"/g, '\\"') + '"]')
+          } catch (e) { wsRow = null }
         }
         const group = wsRow ? sidebarAdapter.recognizeGroupQuiet(wsRow) : null
         const nodes = group && Array.isArray(group.sessions) ? group.sessions : null
@@ -3299,9 +3365,19 @@ function installSidebarStatusDots() {
           OVERFLOW_SIGS.set(btn, overflowSignature(scope, btn, purgedNow))
           return
         }
+        // 分组折叠时上游把 `sessions` 收回成空数组（`expanded ? [...].map(...) : []`），
+        // 所以「空数组」不等于「这组没有会话」。若照旧走下面的空集保护，折叠态的
+        // 分组永远不会被校准 —— 而展开按钮本身就只在折叠态出现，等于整段逻辑永久失效。
+        //
+        // 上游同时给了 `sessionCount`（= 组内会话总数，与展开状态无关），用它来判定：
+        // 到底是真的没会话，还是只是还没展开。注意 `sessionCount` 已过上游的
+        // `sessionVisible` 过滤（排除 archived 与空白会话），但仍可能包含本插件
+        // 软删到回收站、尚未从会话列表摘掉的条目 —— 所以算可见数时要再扣一次。
+        const groupCount = group && typeof group.sessionCount === 'number' ? group.sessionCount : null
+        const collapsed = !nodes.length && groupCount != null && groupCount > 0
         // 本组「上游会列出、且不会被插件藏起来」的会话集合。
         const ids = new Set()
-        for (const node of nodes) {
+        for (const node of (nodes && nodes.length ? nodes : [])) {
           if (!node || node.blank) continue
           const id = node.id != null ? String(node.id) : ''
           if (!id) continue
@@ -3310,22 +3386,51 @@ function installSidebarStatusDots() {
           if (li && li.empty) continue
           ids.add(id)
         }
-        // 已渲染进 DOM 的可见行：只认本组直接子节点里不在隐藏标记中的会话行。
+        // 已渲染进 DOM 的可见行：本组会话行里不在隐藏标记中的那些。
         // 用 `data-dsm-hidden` 而非 style.display 判定——上游折叠父级时行自身
         // 的 display 仍是空串，按 style 判会把看不见的行算成已渲染。
         const rendered = []
-        for (const el of scope.children) {
-          if (el === btn || !el.getAttribute) continue
-          if (el.getAttribute('role') !== 'treeitem') continue
+        for (const el of groupSessionRows(scope, btn)) {
           const k = el.getAttribute('data-row-key') || ''
-          if (!k.startsWith('session:')) continue
           rendered.push({ id: k.slice('session:'.length), pluginHidden: el.hasAttribute(DSM_HIDDEN_ATTR) })
         }
         // 空集/口径不匹配的保护：数据层说「一条都没有」但 DOM 里明明有会话行，
         // 说明 group.sessions 的语义变了（懒加载、上游又换了过滤条件）。此时按
         // 未知处理，绝不能算出 0 把按钮藏掉 —— 那是把可见会话变成不可达。
-        if (!nodes.length || (!ids.size && rendered.length)) {
+        // 折叠态（collapsed）不算「空集」：那是上游把 sessions 收回的正常表现，
+        // 继续走下面的计数分支，否则展开按钮永远得不到校准。
+        if (!nodes.length && !collapsed) {
           restoreOverflowButton(btn)
+          OVERFLOW_SIGS.set(btn, overflowSignature(scope, btn, purgedNow))
+          return
+        }
+        if (!ids.size && rendered.length) {
+          restoreOverflowButton(btn)
+          OVERFLOW_SIGS.set(btn, overflowSignature(scope, btn, purgedNow))
+          return
+        }
+        // 折叠态：上游把 `group.sessions` 收回成空数组，而展开按钮正是这时候
+        // 出现的 —— 也就是说「数据层拿不到成员」和「按钮需要校准」同时发生，
+        // 旧实现于是在这里直接 return，展开计数永远得不到校准（issue #16 的
+        // 「点开没反应 / 数字不动」就是这么来的）。
+        //
+        // 折叠时不再依赖成员 id，改用两条与展开状态无关的信息：
+        //   1) `group.sessionCount` —— 组内会话总数（上游按工作区统计）；
+        //   2) `dsmTrashCountByCwd` —— host 下发的「本工作区回收站条数」。
+        // 两者相减即为展开后实际会出现的行数；折叠时 DOM 里没有会话行，
+        // 已渲染可见数按 0 计。
+        if (collapsed) {
+          const wsCwd = group && typeof group.cwd === 'string' ? group.cwd : null
+          const trashInGroup = wsCwd != null && dsmTrashCountByCwd ? (dsmTrashCountByCwd.get(wsCwd) || 0) : null
+          const visibleTotal = collapsedVisibleTotal(groupCount, trashInGroup)
+          if (visibleTotal == null) {
+            // 老 host / 拿不到 cwd：不猜数字，保持上游原文案。
+            restoreOverflowButton(btn)
+            OVERFLOW_SIGS.set(btn, overflowSignature(scope, btn, purgedNow))
+            return
+          }
+          const more = remainingRows(visibleTotal, 0)
+          applyOverflowPlan(btn, more, '折叠 总数 ' + groupCount + ' / 回收站 ' + trashInGroup)
           OVERFLOW_SIGS.set(btn, overflowSignature(scope, btn, purgedNow))
           return
         }

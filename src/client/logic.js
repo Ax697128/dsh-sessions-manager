@@ -486,6 +486,26 @@ export function remainingRows(visibleTotal, renderedVisible) {
   return Math.max(0, Math.max(0, Math.floor(total)) - shownCount)
 }
 
+// 折叠分组的「还能出现几行」（issue #16 的第二个分支）。
+//
+// 上游 `group.sessions` 只在展开时才有内容（`expanded ? [...].map(...) : []`），
+// 而展开按钮恰恰只在折叠时出现 —— 也就是说「拿不到成员 id」与「需要校准计数」
+// 同时发生。折叠态改用两条与展开无关的信息：
+//   groupCount  上游 `group.sessionCount`，组内会话总数（已过 sessionVisible）
+//   trashInGroup 本工作区的回收站条数（host 按 cwd 统计后下发）
+// 展开后实际会出现的行数 = groupCount − trashInGroup；折叠时 DOM 里没有会话行，
+// 已渲染可见数按 0 计。
+//
+// 任一输入拿不到（老 host 没有该字段 / group 没有 cwd）就返回 null —— 调用方
+// 据此保持上游原文案，绝不猜一个可能错位的数字。
+export function collapsedVisibleTotal(groupCount, trashInGroup) {
+  if (groupCount == null || trashInGroup == null) return null
+  const total = Number(groupCount)
+  const trash = Number(trashInGroup)
+  if (!Number.isFinite(total) || !Number.isFinite(trash)) return null
+  return Math.max(0, Math.floor(total) - Math.max(0, Math.floor(trash)))
+}
+
 // 本组已渲染的可见会话行数。`rows` 是直接子节点里会话行的描述
 // （{ id, pluginHidden }），`visibleIds` 是「上游会列出且插件不会藏」的 id 集合。
 // 插件隐藏的行（回收站 / 空白）与不在集合里的行（空白会话 / 上游过滤口径差异）
