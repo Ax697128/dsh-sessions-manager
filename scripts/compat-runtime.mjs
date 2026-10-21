@@ -631,6 +631,30 @@ try {
               [sidC, sidD].every((sid) => (afterRestore.body.items || []).some((it) => it.sessionId === sid)),
               (afterRestore.body.items || []).map((it) => it.sessionId))
 
+            // 单独删掉的子代理不该被父会话「重新认领」：删除父会话时已经在回收站
+            // 里的子代理保持原状（cascaded 0），恢复父会话也不会把它带回来。
+            const sidE = `dom-e-${Date.now().toString(36)}`
+            const sidF = `dom-f-${Date.now().toString(36)}`
+            {
+              const wE = await sp.create({ id: sidE, cwd: wsA, createdAt: Date.now(), version: CURRENT_FORMAT_VERSION, isSeeded: false, delegationDepth: 0 })
+              await wE.append(mkBatch(0, 1))
+              await wE.flush()
+              await wE.close()
+              const wF = await sp.create({ id: sidF, cwd: wsA, createdAt: Date.now(), version: CURRENT_FORMAT_VERSION, isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: sidE })
+              await wF.append(mkBatch(0, 1))
+              await wF.flush()
+              await wF.close()
+            }
+            await callDom('/archived-sessions/delete', { sessionId: sidF })
+            const delParent = await callDom('/archived-sessions/delete', { sessionId: sidE })
+            check('route /delete: a subagent already in the trash is not re-adopted', delParent.status === 200 && delParent.body.cascaded === 0, delParent.body)
+            await callDom('/archived-sessions/trash/restore', { sessionId: sidE })
+            const trashAfter = await callDom('/archived-sessions/trash/list', {})
+            check('route /trash/restore: the separately deleted subagent stays in the trash',
+              (trashAfter.body.items || []).some((t) => t.sessionId === sidF)
+                && !(trashAfter.body.items || []).some((t) => t.sessionId === sidE),
+              (trashAfter.body.items || []).map((t) => t.sessionId))
+
             const moved = await callDom('/archived-sessions/move', { sessionId: sidA, targetPath: wsB })
             check('route /move (real registry): session relocates to the target workspace',
               moved.status === 200 && (moved.body.moved === true || moved.body.already === true), moved.body)

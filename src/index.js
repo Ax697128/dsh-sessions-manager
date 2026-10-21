@@ -767,8 +767,17 @@ export function apply(ctx) {
     const cascade = opts.cascade !== false
     if (!cascade || !entries) return { ...out, cascaded: 0, cascadedIds: [] }
     const kids = subagentDescendantIdsFrom(entries, sid)
+    // 已经在回收站里的子代理不再碰：它可能是用户**单独**删掉的，重新写一遍会把
+    // 它的删除时间与来源改成「跟随父会话」，此后恢复父会话就会把它带回来——
+    // 与「用户自己删的不会被带走」的承诺相反。跳过即保留它原来的删除语义。
+    let alreadyTrashed = null
+    try {
+      const store = await readTrashStore()
+      alreadyTrashed = new Set(store.items.map((t) => String(t.sessionId)))
+    } catch (e) { alreadyTrashed = null }
     const cascadedIds = []
     for (const kid of kids) {
+      if (alreadyTrashed && alreadyTrashed.has(String(kid))) continue
       try {
         await deleteOne(kid, { entries, cascadeFrom: sid })
         metaCache.invalidate(kid)
