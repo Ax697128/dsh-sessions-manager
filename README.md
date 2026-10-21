@@ -221,6 +221,11 @@ lib/client.js      预构建 client（ModuleLoader CJS handshake）
   - 安装门禁：0.2.0 会校验插件 `peerDependencies` 中的 `@deepseek-ai/dsh*` 版本范围，本插件已放宽为 `>=0.1.0-rc.6`，`0.1.7-rc.2` 与 `0.2.0-rc.2` 通过（issue #13）。
   - 存储域（`ctx.storageDomain`）在 0.2.0 是**领域数据形式**：写入经 schema 校验并在返回前落盘。本插件只写官方域 schema 内的字段，已用**真实域 + 真实 WorkspaceRegistry** 端到端实测（归档 / 恢复 / 列表 / 存储统计 / 跨工作区移动），并回到磁盘介质核验归档状态真的持久化。
   - 活跃会话判定：0.1.7 起 host 侧不再有「当前会话」访问器（三个历史探测全部落空），改由**客户端每 15 秒上报**当前会话 id、host 只在 45 秒新鲜期内采信；用于「移动正在看的会话」（409 / 排队）与「自动归档跳过当前会话」两条保护。心跳停止（面板关闭、标签页隐藏、进程退出）即视为无法证明活跃，放行移动而不是把会话永久锁死。
+- `0.2.1-rc.2`（已实测，issue #16）：
+  - 会话格式仍为 **v4**；`@deepseek-ai/dsh-session-persistence-jsonl` 不再默认导出类，改为 cordis 插件（`{ name, apply }`）——本插件两种形态都能挂载，真栈冒烟按双形态各跑一遍。
+  - 侧栏把会话行与工作区行包进一层 wrapper（`span`）：工作区标题行与分组容器的定位改为「先看直接子节点，找不到再向下找且不跨嵌套子分组」，否则整段校准会静默短路。
+  - 折叠分组的成员数改由与展开无关的 `sessionCount` 校准（上游把 `collapsedSessionRows` 改名 `watermarkRows`，且 `group.sessions` 折叠时为空、展开时经 `sessionVisible()` 过滤）；任一输入缺失就保留上游原文案，不猜数字。
+  - 空分组标题收起：分组容器仍是无 role 的 `groupSection`（`role="group"` 自 0.1.7 起只出现在子分组上），锚点改为工作区标题行的父容器。
 - 未经验证的未来 Runtime 默认只开放能够识别的安全能力；插件不会用方法存在与否冒充行为兼容。
 
 ### 新版 Runtime（SessionHandle 世代，`0.1.3+`）的行为差异与降级说明
