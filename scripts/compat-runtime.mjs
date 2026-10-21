@@ -601,6 +601,36 @@ try {
               return store.purgedSessionIds.includes(sidP) && store.items.length === 0
             })())
 
+            // issue #18 第 4 条：子代理生命周期跟随父会话。真栈验证三件事——
+            // 删父会话连带回收子代理、恢复父会话把子代理一起带回、普通会话不误伤。
+            const sidC = `dom-c-${Date.now().toString(36)}`
+            const sidD = `dom-d-${Date.now().toString(36)}`
+            {
+              const wC = await sp.create({ id: sidC, cwd: wsA, createdAt: Date.now(), version: CURRENT_FORMAT_VERSION, isSeeded: false, delegationDepth: 0 })
+              await wC.append(mkBatch(0, 1))
+              await wC.flush()
+              await wC.close()
+              // 子代理只靠官方 header 字段被识别：origin + parentSession。
+              const wD = await sp.create({ id: sidD, cwd: wsA, createdAt: Date.now(), version: CURRENT_FORMAT_VERSION, isSeeded: false, delegationDepth: 1, origin: 'subagent', parentSession: sidC })
+              await wD.append(mkBatch(0, 1))
+              await wD.flush()
+              await wD.close()
+            }
+            for (const sid of [sidC, sidD]) await callDom('/archived-sessions/archive', { sessionId: sid })
+            const delCascade = await callDom('/archived-sessions/delete', { sessionId: sidC })
+            check('route /delete (real domain): parent carries its subagent out', delCascade.status === 200 && delCascade.body.cascaded === 1, delCascade.body)
+            const afterDel = await callDom('/archived-sessions/list', {})
+            check('route /delete: parent and subagent both left the list',
+              !(afterDel.body.items || []).some((it) => it.sessionId === sidC || it.sessionId === sidD),
+              (afterDel.body.items || []).map((it) => it.sessionId))
+            const restoreCascade = await callDom('/archived-sessions/trash/restore', { sessionId: sidC })
+            check('route /trash/restore (real domain): subagent returns with the parent',
+              restoreCascade.status === 200 && restoreCascade.body.cascaded === 1, restoreCascade.body)
+            const afterRestore = await callDom('/archived-sessions/list', {})
+            check('route /trash/restore: both rows are back in the list',
+              [sidC, sidD].every((sid) => (afterRestore.body.items || []).some((it) => it.sessionId === sid)),
+              (afterRestore.body.items || []).map((it) => it.sessionId))
+
             const moved = await callDom('/archived-sessions/move', { sessionId: sidA, targetPath: wsB })
             check('route /move (real registry): session relocates to the target workspace',
               moved.status === 200 && (moved.body.moved === true || moved.body.already === true), moved.body)
