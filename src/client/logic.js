@@ -221,6 +221,26 @@ export function noticeToastPlan(raw, seenIds, max = 2) {
   }
 }
 
+// issue #18 第 1 条：把「父会话不在当前列表」的子代理从顶层行里摘出来。
+//
+// foldSubagents 只收「父在列表里」的子代理；其余子代理原先留在顶层平铺成
+// 一行行「(无标题)」，一个多代理工作日能攒出上百行。这里把它们分成一组，
+// 调用方渲染成一张可展开的卡片——不污染列表，也不丢会话。
+// 输入应为 foldBranches 之后的 topList（分支聚拢不会碰子代理）。
+export function foldOrphanSubagents(items, lineage) {
+  const list = Array.isArray(items) ? items : []
+  const table = lineage && typeof lineage === 'object' ? lineage : {}
+  const rows = []
+  const orphans = []
+  for (const it of list) {
+    const id = it && it.sessionId != null ? String(it.sessionId) : ''
+    const info = id ? table[id] : null
+    if (info && info.origin === 'subagent') orphans.push(it)
+    else rows.push(it)
+  }
+  return { rows, orphans }
+}
+
 // —— T3（3.7.0）：分支聚拢 ——
 // 把「同一父会话派生出的普通分支会话」归组，收拢到组锚（真实父行或合成头）
 // 之下。子代理已由 foldSubagents 先行摘除，本函数只处理非子代理的分支血缘。

@@ -29,7 +29,7 @@ import { createPersistenceAdapter } from './compat/persistence.js'
 import { detectCapabilities, requireCapability } from './compat/capabilities.js'
 import { pathOwnsSession } from './path-guard.js'
 import { purgeSessionArtifacts, moveSessionToCwd } from './handle-era-ops.js'
-import { classifyLineage, emptyScanCandidate, isEmptyEventTypes, EMPTY_DECODE_LIMIT } from './lineage.js'
+import { classifyLineage, emptyScanCandidate, isEmptyEventTypes, subagentDescendantsOf, EMPTY_DECODE_LIMIT } from './lineage.js'
 
 // 构建指纹：build.mjs 以 define 在编译期注入；直接以源码运行（测试）时为 'dev'。
 // 用途：capabilities 带出 buildStamp，一眼判断「运行中的 host 是不是这份构建」——
@@ -669,7 +669,7 @@ export function apply(ctx) {
   // it from the workspace) orphaned the session into DSH's "未分组" group and
   // made restore land in 未分组 instead of the original workspace — so we leave
   // the file where it is and let the sidebar DOM shim hide the row instead.
-  async function deleteOne(sid) {
+  async function deleteOne(sid, opts = {}) {
     requireSessionId(sid)
     // Soft-delete is always allowed — including the currently-active conversation.
     // The log file stays in its original workspace dir (recorded in the 回收站
@@ -682,7 +682,9 @@ export function apply(ctx) {
     let removedPath = null
     let persistenceEntry = null
     try {
-      const entries = await persistence.listEntries()
+      // 级联删除时由调用方传入同一份 listEntries 快照：一个父会话带上 N 个子代理
+      // 时不重复扫盘（issue #18 第 4 条）。
+      const entries = Array.isArray(opts.entries) ? opts.entries : await persistence.listEntries()
       const found = entries.find((entry) => entry.id === sid) || null
       persistenceEntry = found
       header = found ? found.header : null
@@ -726,12 +728,77 @@ export function apply(ctx) {
         sizeBytes: persistenceEntry && Number.isFinite(persistenceEntry.sizeBytes) ? persistenceEntry.sizeBytes : null,
         wasArchived: archived, deletedAt: Date.now(),
       }
+      // 跟随父会话一起回收的子代理：记住来源，恢复/彻底删除父会话时按它级联
+      // （用户单独删除的子代理没有这个字段，不会被父会话的恢复带着走）。
+      if (opts.cascadeFrom) entry.cascadeFrom = String(opts.cascadeFrom)
       const at = store.items.findIndex((t) => String(t.sessionId) === sid)
       if (at >= 0) store.items[at] = entry
       else store.items.push(entry)
       store.purgedSessionIds = store.purgedSessionIds.filter((id) => id !== sid)
     })
     return { ok: true, trashed: true }
+  }
+
+  // issue #18 第 4 条：子代理会话的生命周期跟随父会话。
+  //
+  // 用户反馈「删除父会话，子代理会遗留在活动会话中，污染列表」——先前删除只处理
+  // 传入的那一个 id，子代理成了无父孤儿。这里按官方 header 的 origin/parentSession
+  // 收集后代（零解码，复用同一个 listEntries 快照），父会话删除时一并回收。
+  //
+  // 只走官方字段，且有步数上限与 visited 防环；任何异常都退回「只删父会话」，
+  // 绝不因为血缘表坏掉而拒绝删除。判定本身是纯函数（lineage.js），单测覆盖。
+  function subagentDescendantIdsFrom(entries, rootId) {
+    const headers = []
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (entry && entry.header) headers.push(entry.header)
+    }
+    // live 会话可能还没进 listEntries 快照，但它不会有「已落盘的后代」缺失问题；
+    // 已持久化的子代理都在 entries 里，所以这里只走快照，避免重复扫描。
+    return subagentDescendantsOf(headers, rootId)
+  }
+
+  // 删除一个会话 +（可选）它的子代理后代。返回 cascaded 数量供 UI 如实提示。
+  async function deleteWithSubagents(sid, opts = {}) {
+    let entries = Array.isArray(opts.entries) ? opts.entries : null
+    if (!entries) {
+      try { entries = await persistence.listEntries() } catch (e) { entries = null }
+    }
+    const out = await deleteOne(sid, { entries })
+    const cascade = opts.cascade !== false
+    if (!cascade || !entries) return { ...out, cascaded: 0, cascadedIds: [] }
+    const kids = subagentDescendantIdsFrom(entries, sid)
+    const cascadedIds = []
+    for (const kid of kids) {
+      try {
+        await deleteOne(kid, { entries, cascadeFrom: sid })
+        metaCache.invalidate(kid)
+        cascadedIds.push(kid)
+      } catch (e) { /* 单个子代理失败不拖垮整次删除 */ }
+    }
+    return { ...out, cascaded: cascadedIds.length, cascadedIds }
+  }
+
+  // 与删除对称：恢复 / 彻底删除父会话时，把它连带回收的子代理一并处理。
+  // 只认 entry.cascadeFrom（用户单独删掉的子代理没有该字段，不会被带走），
+  // 且只在回收站里找——父会话恢复后子代理不会留在回收站里变成孤儿。
+  async function cascadeTrashChildren(sid, op) {
+    let kids = []
+    try {
+      const store = await readTrashStore()
+      kids = store.items
+        .filter((t) => String(t.cascadeFrom || '') === String(sid))
+        .map((t) => String(t.sessionId))
+    } catch (e) { return [] }
+    const results = []
+    for (const kid of kids) {
+      try {
+        results.push({ sessionId: kid, ok: true, ...(await op(kid)) })
+        metaCache.invalidate(kid)
+      } catch (e) {
+        results.push({ sessionId: kid, ok: false, error: String((e && e.message) || e) })
+      }
+    }
+    return results
   }
 
   // 恢复前的底层校验（0.1.3 契约下 restoreIndexedSession 不再无条件可用）：
@@ -1807,11 +1874,30 @@ export function apply(ctx) {
         const persistBatch = {}
         for (const [id, desc] of batch) {
           try {
-            const types = []
+            // issue #18 第 5 条：只收事件类型会把「插件注入上下文」的会话误判成
+            // 有内容。`agent/inbox/spliced` 需要看插入项来源，这里只留判定所需的
+            // 最小信息（source 对象 + removedCount），绝不把消息正文带进内存。
+            const events = []
             await persistence.inspectSession(id, { onEvents: (b) => {
-              for (const ev of b || []) if (types.length < 64) types.push(ev && ev.type)
+              for (const ev of b || []) {
+                if (events.length >= 64) break
+                if (!ev) { events.push(undefined); continue }
+                if (ev.type !== 'agent/inbox/spliced') { events.push({ type: ev.type }); continue }
+                const data = ev.data && typeof ev.data === 'object' ? ev.data : null
+                events.push({
+                  type: ev.type,
+                  data: data
+                    ? {
+                        removedCount: data.removedCount,
+                        inserted: Array.isArray(data.inserted)
+                          ? data.inserted.map((m) => ({ source: m && typeof m === 'object' ? m.source : null }))
+                          : null,
+                      }
+                    : null,
+                })
+              }
             } })
-            const isEmpty = isEmptyEventTypes(types)
+            const isEmpty = isEmptyEventTypes(events)
             emptyScanCache.set(id, { sizeBytes: desc.sizeBytes, empty: isEmpty })
             persistBatch[id] = { empty: isEmpty ? 1 : 0, fingerprint: `sz:${desc.sizeBytes}`, updatedAt: Date.now() }
           } catch (e) {
@@ -2084,7 +2170,9 @@ export function apply(ctx) {
           const body = await readJsonBody(req)
           const sid = body && typeof body.sessionId === 'string' ? body.sessionId : null
           if (!sid) return json(res, { ok: false, error: 'missing sessionId' }, 400)
-          const out = await deleteOne(sid)
+          // issue #18 第 4 条：默认连带子代理一起回收（cascadeSubagents:false 可保留
+          // 子代理——它们在面板里会落进「未归属子代理」卡片，仍可管理）。
+          const out = await deleteWithSubagents(sid, { cascade: body.cascadeSubagents !== false })
           // 日志被搬进回收站（文件已不在原处）：丢弃缓存条目，避免下次 stat 失败
           // 时残留旧元数据。
           metaCache.invalidate(sid)
@@ -2104,11 +2192,24 @@ export function apply(ctx) {
           const ids = parseIds(body)
           if (!ids || ids.length === 0) return json(res, { ok: false, error: 'missing sessionIds' }, 400)
           const results = []
+          // 级联与单删一致：一次快照，多个父会话的子代理不会互相重复回收。
+          let cascadeEntries = null
+          try { cascadeEntries = await persistence.listEntries() } catch (e) { cascadeEntries = null }
+          const cascade = body.cascadeSubagents !== false
+          const done = new Set()
           for (const sid of ids) {
-            try { results.push({ sessionId: sid, ok: true, ...(await deleteOne(sid)) }); metaCache.invalidate(sid) }
-            catch (e) { results.push({ sessionId: sid, ok: false, error: String((e && e.message) || e) }) }
+            try {
+              if (done.has(sid)) { results.push({ sessionId: sid, ok: true, trashed: true, cascaded: 0 }); continue }
+              const out = cascade && cascadeEntries
+                ? await deleteWithSubagents(sid, { cascade: true, entries: cascadeEntries })
+                : await deleteOne(sid, { entries: cascadeEntries })
+              done.add(sid)
+              if (Array.isArray(out.cascadedIds)) for (const k of out.cascadedIds) done.add(k)
+              results.push({ sessionId: sid, ok: true, ...out })
+              metaCache.invalidate(sid)
+            } catch (e) { results.push({ sessionId: sid, ok: false, error: String((e && e.message) || e) }) }
           }
-          json(res, { ok: true, deleted: results.filter((r) => r.ok).length, results })
+          json(res, { ok: true, deleted: results.filter((r) => r.ok).length, cascaded: results.reduce((n, r) => n + (Number(r.cascaded) || 0), 0), results })
         } catch (e) {
           json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
         }
@@ -2184,7 +2285,9 @@ export function apply(ctx) {
           if (!sid) return json(res, { ok: false, error: 'missing sessionId' }, 400)
           const out = await restoreFromTrash(sid)
           metaCache.invalidate(sid)
-          json(res, out)
+          // 连带回收的子代理一起回来，父子生命周期保持一致。
+          const cascaded = await cascadeTrashChildren(sid, (kid) => restoreFromTrash(kid))
+          json(res, { ...out, cascaded: cascaded.filter((r) => r.ok).length, cascadedResults: cascaded.length ? cascaded : undefined })
         } catch (e) {
           json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
         }
@@ -2204,7 +2307,14 @@ export function apply(ctx) {
           // 彻底删除：持久标题索引里的条目一并清掉（issue #1 P4）。
           try { await titleIndex.remove([sid]) } catch (e) { /* 索引清理失败不阻塞删除结果 */ }
             try { await emptyIndex.remove([sid]) } catch (e) { /* 同上 */ }
-          json(res, out)
+          // 连带回收的子代理一并物理删除（否则父会话消失、子代理孤零零留在回收站）。
+          const cascaded = await cascadeTrashChildren(sid, async (kid) => {
+            const r = await purgeFromTrash(kid)
+            try { await titleIndex.remove([kid]) } catch (e) {}
+            try { await emptyIndex.remove([kid]) } catch (e) {}
+            return r
+          })
+          json(res, { ...out, cascaded: cascaded.filter((r) => r.ok).length })
         } catch (e) {
           json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
         }
@@ -2221,8 +2331,19 @@ export function apply(ctx) {
           if (!ids || ids.length === 0) return json(res, { ok: false, error: 'missing sessionIds' }, 400)
           const results = []
           for (const sid of ids) {
-            try { results.push({ sessionId: sid, ok: true, ...(await purgeFromTrash(sid)) }); metaCache.invalidate(sid); await titleIndex.remove([sid]).catch(() => {}); await emptyIndex.remove([sid]).catch(() => {}) }
-            catch (e) { results.push({ sessionId: sid, ok: false, error: String((e && e.message) || e) }) }
+            try {
+              results.push({ sessionId: sid, ok: true, ...(await purgeFromTrash(sid)) })
+              metaCache.invalidate(sid)
+              await titleIndex.remove([sid]).catch(() => {})
+              await emptyIndex.remove([sid]).catch(() => {})
+              // 与单条彻底删除一致：连带回收的子代理一并清掉。
+              await cascadeTrashChildren(sid, async (kid) => {
+                const r = await purgeFromTrash(kid)
+                try { await titleIndex.remove([kid]) } catch (e) {}
+                try { await emptyIndex.remove([kid]) } catch (e) {}
+                return r
+              })
+            } catch (e) { results.push({ sessionId: sid, ok: false, error: String((e && e.message) || e) }) }
           }
           json(res, { ok: true, purged: results.filter((r) => r.ok).length, results })
         } catch (e) {

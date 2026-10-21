@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { aliveSessionCount, applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, moveNoticeText, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes } from '../src/client/logic.js'
+import { aliveSessionCount, applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldOrphanSubagents, foldSubagents, moveNoticeText, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes } from '../src/client/logic.js'
 
 // ---- dotStateFor：状态点语义 ----------------------------------------------
 // 历史回归：DSH 把 running 报成 ongoing（9766476）；done 在当前行上不能亮绿
@@ -823,4 +823,42 @@ test('alive count reports unknown instead of empty for missing or empty data', (
   assert.equal(aliveSessionCount('nope', new Set()), null)
   // 没有一条带 id（结构不认识）→ 同样是「不知道」，不是「组空」。
   assert.equal(aliveSessionCount([{ id: null }, { nope: 1 }], new Set()), null)
+})
+
+// ---- foldOrphanSubagents：父会话不在列表的子代理（issue #18 第 1 条）--------
+// 这些行先前平铺成上百个「(无标题)」，现在是单独的「未归属子代理」卡片。
+test('foldOrphanSubagents moves parentless subagents out of the top-level rows', () => {
+  const items = [
+    { sessionId: 'p1' },
+    { sessionId: 'k1' },
+    { sessionId: 'k2' },
+    { sessionId: 'plain' },
+  ]
+  const lineage = {
+    k1: { origin: 'subagent', parentSession: 'gone' },
+    k2: { origin: 'subagent', parentSession: 'gone' },
+  }
+  const { rows, orphans } = foldOrphanSubagents(items, lineage)
+  assert.deepEqual(rows.map((x) => x.sessionId), ['p1', 'plain'])
+  assert.deepEqual(orphans.map((x) => x.sessionId), ['k1', 'k2'])
+})
+
+test('foldOrphanSubagents keeps fork branches and ordinary sessions in place', () => {
+  const items = [{ sessionId: 'a' }, { sessionId: 'b' }, { sessionId: 'c' }]
+  const lineage = {
+    // 分叉分支有 parentSession 但 origin 不是 subagent：它是独立会话，留在列表里。
+    a: { origin: null, parentSession: 'root' },
+    b: { origin: 'subagent', parentSession: 'root' },
+    c: {},
+  }
+  const { rows, orphans } = foldOrphanSubagents(items, lineage)
+  assert.deepEqual(rows.map((x) => x.sessionId), ['a', 'c'])
+  assert.deepEqual(orphans.map((x) => x.sessionId), ['b'])
+})
+
+test('foldOrphanSubagents tolerates malformed input', () => {
+  assert.deepEqual(foldOrphanSubagents(null, null), { rows: [], orphans: [] })
+  assert.deepEqual(foldOrphanSubagents([null, { nope: 1 }, { sessionId: 'x' }], null).rows.length, 3)
+  // lineage 里没有对应条目 = 普通会话（保持原位），绝不误判成子代理。
+  assert.deepEqual(foldOrphanSubagents([{ sessionId: 'x' }], {}).orphans, [])
 })

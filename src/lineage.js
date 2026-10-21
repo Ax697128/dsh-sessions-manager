@@ -45,15 +45,52 @@ const LIFECYCLE_EVENT_TYPES = new Set([
   'approval/policy',
 ])
 
+// 注入型事件：`agent/inbox/spliced` 把消息写进下一轮的 inbox。它不是用户输入，
+// 但它**可能**是插件塞进来的上下文/指令（issue #18 第 5 条：openviking-memory
+// 之类的记忆插件会这么干）。这种会话在界面上空空如也，先前却被算作「有内容」
+// → 永远进不了「空白」分类，只能一直占着列表。
+//
+// 判定按「插入项来源」做，而不是按事件类型一刀切——真实用户消息同样走这个
+// 事件，绝不能连人打的字一起判空：
+//   - 每条插入消息都带 source，且 source.form === 'instructions' 或
+//     source.kind 以 'plugin:' 开头 → 纯注入，算噪声；
+//   - 有任何一条没有 source / 是普通用户消息 → 算内容；
+//   - 同时带 removedCount（删了东西）→ 算内容（可能删掉了真实消息）。
+function isInjectedMessage(msg) {
+  const src = msg && typeof msg === 'object' ? msg.source : null
+  if (!src || typeof src !== 'object') return false
+  if (src.form === 'instructions') return true
+  return typeof src.kind === 'string' && src.kind.startsWith('plugin:')
+}
+
+// 单条事件是否属于「不构成内容」的噪声。接受两种形状：
+//   - 旧形状：事件类型字符串（向后兼容，历史调用点与单测仍这样传）
+//   - 新形状：{ type, data } —— 只有 inbox 注入需要看 data
+export function isNoiseEvent(event) {
+  const type = typeof event === 'string' ? event : event && typeof event === 'object' ? event.type : null
+  if (typeof type !== 'string') return false
+  if (LIFECYCLE_EVENT_TYPES.has(type)) return true
+  if (type !== 'agent/inbox/spliced') return false
+  const data = event && typeof event === 'object' ? event.data : null
+  if (!data || typeof data !== 'object') return false
+  const removed = Number(data.removedCount)
+  if (Number.isFinite(removed) && removed > 0) return false
+  // inserted 缺失/畸形一律按内容处理（宁可漏判，不可错杀）。
+  if (!Array.isArray(data.inserted)) return false
+  if (data.inserted.length === 0) return true
+  return data.inserted.every(isInjectedMessage)
+}
+
 /**
- * @param {Array<string|undefined>} types 事件类型序列（不含头部也可，含头部
- *        也可——'session' 在放行清单里）。0 条 = 头部之外无任何事件，视为空。
+ * @param {Array<string|{type?:string,data?:object}|undefined>} events 事件序列
+ *        （类型字符串或带 data 的事件对象；不含头部也可，含头部也可——
+ *        'session' 在放行清单里）。0 条 = 头部之外无任何事件，视为空。
  * @returns {boolean}
  */
-export function isEmptyEventTypes(types) {
-  if (!Array.isArray(types)) return false
-  for (const t of types) {
-    if (typeof t !== 'string' || !LIFECYCLE_EVENT_TYPES.has(t)) return false
+export function isEmptyEventTypes(events) {
+  if (!Array.isArray(events)) return false
+  for (const ev of events) {
+    if (!isNoiseEvent(ev)) return false
   }
   return true
 }
@@ -62,6 +99,49 @@ export function isEmptyEventTypes(types) {
 // subagent or a fork branch; `empty` is published as null (= not yet judged)
 // and refined in the background. Ordinary top-level sessions return null —
 // they only ever gain an entry once a real decode says empty:true.
+export const SUBAGENT_CASCADE_LIMIT = 500
+
+/**
+ * 子代理后代（issue #18 第 4 条：子代理生命周期跟随父会话）。
+ *
+ * 只认官方 header 的 `origin === 'subagent'` + `parentSession`，零解码：
+ * 删除父会话时由宿主把同一份 listEntries 快照传进来，一次扫描算出整棵子树。
+ *
+ * @param {Array<object>} headers 会话 header 列表（可为 null / 含畸形项）
+ * @param {string} rootId 父会话 id
+ * @param {number} [limit] 节点上限（默认 SUBAGENT_CASCADE_LIMIT，防病态血缘）
+ * @returns {string[]} 后代 id（广度优先，含孙代；不含 rootId 自身）
+ */
+export function subagentDescendantsOf(headers, rootId, limit = SUBAGENT_CASCADE_LIMIT) {
+  const root = rootId == null ? '' : String(rootId)
+  if (!root) return []
+  const kidsOf = new Map()
+  for (const h of Array.isArray(headers) ? headers : []) {
+    if (!h || typeof h !== 'object' || h.id == null || h.origin !== 'subagent') continue
+    const id = String(h.id)
+    const parent = h.parentSession != null ? String(h.parentSession) : ''
+    // 自指 / 空父一律跳过：它们不构成「后代」边。
+    if (!parent || parent === id) continue
+    if (!kidsOf.has(parent)) kidsOf.set(parent, [])
+    kidsOf.get(parent).push(id)
+  }
+  const max = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : SUBAGENT_CASCADE_LIMIT
+  const out = []
+  const visited = new Set([root])
+  const queue = [root]
+  while (queue.length && out.length < max) {
+    const cur = queue.shift()
+    for (const kid of kidsOf.get(cur) || []) {
+      if (visited.has(kid)) continue
+      visited.add(kid)
+      out.push(kid)
+      queue.push(kid)
+      if (out.length >= max) break
+    }
+  }
+  return out
+}
+
 export function classifyLineage(header) {
   if (!header || typeof header !== 'object') return null
   const origin = header.origin === 'subagent' ? 'subagent' : null

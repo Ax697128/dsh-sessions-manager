@@ -10,8 +10,8 @@
  * @module dsh-sessions-manager/client
  */
 
-import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { aliveSessionCount, applyTagFilter, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldSubagents, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { aliveSessionCount, applyTagFilter, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dotStateFor, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldOrphanSubagents, foldSubagents, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes } from './logic.js'
 
 export const inject = ['slots']
 
@@ -193,6 +193,10 @@ body[data-ds-dark-theme] .archv{color-scheme:dark}
 .dlg{width:min(420px,92vw);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l3);border-radius:14px;padding:18px;box-shadow:0 16px 48px rgb(0 0 0/.28);display:flex;flex-direction:column;gap:12px}
 .dlg-title{font-size:15px;font-weight:650;color:var(--dsw-alias-label-primary);margin:0}
 .dlg-text{font-size:13px;line-height:1.6;color:var(--dsw-alias-label-secondary);margin:0;word-break:break-all}
+/* issue #18 第 4 条：删除确认框里的「连带子代理」勾选行。与面板其它勾选项
+   同一套视觉语言（13px / 中性标签色 / 8px 间距），不自造按钮样式。 */
+.dlg-check{display:flex;align-items:flex-start;gap:8px;font-size:13px;line-height:1.55;color:var(--dsw-alias-label-secondary);cursor:pointer}
+.dlg-check input{margin:2px 0 0;flex:none}
 .dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:2px}
 /* ---- T4 标签编辑/管理 sheet 与筛选保存控件（全部走 --dsw token） ---- */
 .dsm-taglist{display:flex;flex-direction:column;gap:2px;max-height:240px;overflow:auto}
@@ -499,6 +503,10 @@ function SessionPanel({ workspacesSvc }) {
   const [sortBy, setSortBy] = useState(() => ['newest', 'oldest', 'title'].includes(initialPrefs.sortBy) ? initialPrefs.sortBy : 'newest')
   const [selected, setSelected] = useState({})
   const [delTarget, setDelTarget] = useState(null)
+  // issue #18 第 4 条：删除父会话默认连带回收它的子代理（生命周期绑定），
+  // 取消勾选则保留——保留的子代理会落进「未归属子代理」卡片，仍可单独处理。
+  const [cascadeSub, setCascadeSub] = useState(true)
+  useEffect(() => { if (delTarget) setCascadeSub(true) }, [delTarget])
   const [confirmBatch, setConfirmBatch] = useState(false)
   const [batchMoveOpen, setBatchMoveOpen] = useState(false)
   const [busy, setBusy] = useState(null)
@@ -577,6 +585,9 @@ function SessionPanel({ workspacesSvc }) {
     return next
   })
   const [groupByLineage, setGroupByLineage] = useState(() => initialPrefs.groupByLineage !== false)
+  // issue #18 第 1 条：父会话不在列表里的子代理收进一张「未归属子代理」卡片，
+  // 展开态不持久化——默认收起，避免又一次把列表撑长。
+  const [openOrphans, setOpenOrphans] = useState(false)
 
   // —— T4（3.7.0）标签 + 已存筛选 ——
   // 数据源纪律：卡片 chip、编辑 sheet 勾选、管理行用量、筛选下拉，一律以本
@@ -1121,18 +1132,38 @@ function SessionPanel({ workspacesSvc }) {
   const canMove = actionCapability('relocateSession', 'move')
   const canRestoreTrash = actionCapability('restoreIndexedSession', 'restoreTrash')
 
-  const archivedList = sessions ? sessions.filter((x) => x.archived) : []
-  const activeList = sessions ? sessions.filter((x) => !x.archived) : []
-  const starredList = starredOf(sessions)
-  // issue #6 之三：空白会话单分一类。空白判定来自宿主血缘快照（sizeBytes 阈值
-  // 实测校准），与侧栏「空白」标记同源——两处永远不会各说各话。
-  const emptyList = useMemo(() => {
-    if (!sessions) return []
-    return sessions.filter((x) => { const li = lineage[String(x.sessionId)]; return !!(li && li.empty) })
-  }, [sessions, lineage])
+  // issue #18 第 1 条：子代理会话不是「一条可管理的会话」，而是父会话的下属。
+  // 先前它们以顶层行的形式混进「活动 / 全部」，一个重度的多代理工作日能攒出
+  // 上百个「(无标题)」——计数、全选、批量操作全被它们污染。这里统一判定，
+  // 表格计数与顶层行都用它排除；子代理只出现在父会话的「N 子代理」里。
+  const isSubagentItem = useCallback((item) => {
+    const li = item ? lineage[String(item.sessionId)] : null
+    return !!(li && li.origin === 'subagent')
+  }, [lineage])
+  // 列表管线仍要拿到子代理行（折叠判定要用它们挂到父会话下），所以保留一份
+  // 未过滤的集合；只有「计数 / 顶层行 / 全选」用 topOnly。
+  const { archivedAll, activeAll, starredAll, emptyAll } = useMemo(() => ({
+    archivedAll: sessions ? sessions.filter((x) => x.archived) : [],
+    activeAll: sessions ? sessions.filter((x) => !x.archived) : [],
+    starredAll: starredOf(sessions),
+    // issue #6 之三：空白会话单分一类。空白判定来自宿主血缘快照（sizeBytes 阈值
+    // 实测校准），与侧栏「空白」标记同源——两处永远不会各说各话。
+    emptyAll: sessions ? sessions.filter((x) => { const li = lineage[String(x.sessionId)]; return !!(li && li.empty) }) : [],
+  }), [sessions, lineage])
+  // 血缘分组开着时，计数只算「能作为一行被操作的会话」。平铺模式保持原样
+  // （用户显式选择与 DSH 原生一致的平铺视图）。
+  const topOnly = useCallback((arr) => (groupByLineage ? arr.filter((x) => !isSubagentItem(x)) : arr), [groupByLineage, isSubagentItem])
+  const archivedList = useMemo(() => topOnly(archivedAll), [topOnly, archivedAll])
+  const activeList = useMemo(() => topOnly(activeAll), [topOnly, activeAll])
+  const starredList = useMemo(() => topOnly(starredAll), [topOnly, starredAll])
+  const emptyList = useMemo(() => topOnly(emptyAll), [topOnly, emptyAll])
+  // 「全部」计数：血缘分组下同样只算能作为一行的会话（子代理在父行徽标里）。
+  const totalTopCount = useMemo(() => topOnly(sessions || []).length, [topOnly, sessions])
   const list = useMemo(() => {
     if (filter === 'trash') return []
-    const base = filter === 'archived' ? archivedList : filter === 'active' ? activeList : filter === 'starred' ? starredList : filter === 'empty' ? emptyList : sessions || []
+    // 注意用 *All（含子代理）：列表管线要靠它们把子代理挂到父会话下；排除子代理
+    // 发生在折叠之后的顶层行与计数（见 isSubagentItem / topOnly）。
+    const base = filter === 'archived' ? archivedAll : filter === 'active' ? activeAll : filter === 'starred' ? starredAll : filter === 'empty' ? emptyAll : sessions || []
     // T4 标签筛选（单选，v1 不追多选 AND——理由见 logic.applyTagFilter）：在
     // 搜索/工作区之前先按标签收敛；''/未就绪时谓词原样返回，行为与旧版一致。
     const tagPassed = applyTagFilter(base, tagsReady ? tagFilter : '')
@@ -1149,7 +1180,7 @@ function SessionPanel({ workspacesSvc }) {
       if (sortBy === 'title') return effectiveTitleOf(a, dsmAuthoritativeTitles).localeCompare(effectiveTitleOf(b, dsmAuthoritativeTitles), 'zh-CN')
       return Number(b.createdAt || 0) - Number(a.createdAt || 0)
     })
-  }, [sessions, filter, query, workspaceFilter, sortBy, emptyList, starredList, tagFilter, tagsReady])
+  }, [sessions, archivedAll, activeAll, starredAll, emptyAll, filter, query, workspaceFilter, sortBy, tagFilter, tagsReady])
   const selIds = Object.keys(selected).filter((k) => selected[k])
   // 「回收站」是独立视图，不共用会话列表。
   const showSessionList = filter !== 'trash'
@@ -1160,11 +1191,16 @@ function SessionPanel({ workspacesSvc }) {
   // 3.7.0 分支聚拢：先子代理折叠、后分支聚拢（foldBranches 的输入契约——顺序反了
   // 会让分支父行的子代理变孤儿弹回顶层）。链式分支拍平进同一组；缺失父出
   // 「来源：<短ID>」合成头；「一行不丢」由纯函数守恒不变量保证。
-  const { topList, kidsOf, foldedCount, branchGroupsOf, branchFolded, branchGroupCount } = useMemo(() => {
-    if (!groupByLineage) return { topList: list, kidsOf: new Map(), foldedCount: 0, branchGroupsOf: new Map(), branchFolded: 0, branchGroupCount: 0 }
+  const { topList, kidsOf, foldedCount, branchGroupsOf, branchFolded, branchGroupCount, orphanSubagents } = useMemo(() => {
+    if (!groupByLineage) return { topList: list, kidsOf: new Map(), foldedCount: 0, branchGroupsOf: new Map(), branchFolded: 0, branchGroupCount: 0, orphanSubagents: [] }
     const kids = foldSubagents(list, lineage)
     const br = foldBranches(kids.topList, lineage)
-    return { topList: br.topList, kidsOf: kids.kidsOf, foldedCount: kids.foldedCount, branchGroupsOf: br.branchGroupsOf, branchFolded: br.foldedCount, branchGroupCount: br.groupCount }
+    // issue #18 第 1 条：分支聚拢不会动子代理（branchParentOf 明确挡掉），所以
+    // 走到这里还留在顶层的子代理 = 父会话不在当前列表（已删除 / 已归档 / 被筛选）。
+    // 它们先前就地平铺成「(无标题)」行；现在收进一张「未归属子代理」卡片，
+    // 既不污染列表，也不会丢（展开仍可打开 / 归档 / 删除）。
+    const { rows, orphans } = foldOrphanSubagents(br.topList, lineage)
+    return { topList: rows, kidsOf: kids.kidsOf, foldedCount: kids.foldedCount, branchGroupsOf: br.branchGroupsOf, branchFolded: br.foldedCount, branchGroupCount: br.groupCount, orphanSubagents: orphans }
   }, [list, lineage, groupByLineage])
   // D5：query 命中折叠组内成员（或子代理）→ 渲染层强制展开——「看得见才搜得到」。
   const matchIds = useMemo(() => {
@@ -1177,6 +1213,9 @@ function SessionPanel({ workspacesSvc }) {
   }, [sessions, query])
   const kidsHit = (parentId) => !!(matchIds && (kidsOf.get(String(parentId)) || []).some((k) => matchIds.has(String(k.sessionId))))
   const branchHit = (rootId) => !!(matchIds && (branchGroupsOf.get(String(rootId)) || []).some((m) => matchIds.has(String(m.sessionId))))
+  // 搜索命中未归属子代理 → 强制展开那张卡片（「看得见才搜得到」同样适用）。
+  const orphanHit = !!(matchIds && orphanSubagents.some((k) => matchIds.has(String(k.sessionId))))
+  const orphanOpen = openOrphans || orphanHit
   const syntheticCount = groupByLineage ? topList.reduce((n, it) => n + (it && it.syntheticRoot ? 1 : 0), 0) : 0
 
   // 子代理折叠分两个部件，各自贴在它该在的位置：
@@ -1205,6 +1244,29 @@ function SessionPanel({ workspacesSvc }) {
   // 分支标记 hover 说明来源；空白标记提示去「空白」分类清理。
   // 父会话标题查找走一次性 Map（sessions 会到几百条，每卡片 find 是 O(n²)）。
   const sessionsById = useMemo(() => new Map((sessions || []).map((x) => [String(x.sessionId), x])), [sessions])
+  // issue #18 第 4 条：删除确认框里的「连同 N 个子代理」。按官方血缘字段递归数
+  // 一遍（只有对话框打开时才计算一次，列表渲染路径不承担这个成本）。
+  const delCascadeCount = useMemo(() => {
+    if (!delTarget) return 0
+    const childMap = new Map()
+    for (const [id, li] of Object.entries(lineage || {})) {
+      if (!li || li.origin !== 'subagent' || !li.parentSession) continue
+      const p = String(li.parentSession)
+      if (!childMap.has(p)) childMap.set(p, [])
+      childMap.get(p).push(String(id))
+    }
+    const seen = new Set([String(delTarget.sessionId)])
+    const queue = [String(delTarget.sessionId)]
+    let n = 0
+    while (queue.length) {
+      const cur = queue.shift()
+      for (const kid of childMap.get(cur) || []) {
+        if (seen.has(kid)) continue
+        seen.add(kid); n++; queue.push(kid)
+      }
+    }
+    return n
+  }, [delTarget, lineage])
   const branchBadge = (sessionId) => {
     const li = lineage[String(sessionId)]
     if (!li || li.origin === 'subagent' || !li.parentSession) return null
@@ -1319,9 +1381,13 @@ function SessionPanel({ workspacesSvc }) {
 
   const toggle = (id) => setSelected((s) => ({ ...s, [id]: !s[id] }))
   const clearSel = () => setSelected({})
+  // issue #18 第 3 条：全选只选「当前列表里真正占据一行、且能单独勾选」的会话。
+  // 旧实现遍历的是过滤后的原始 list（含被折叠的子代理、被聚拢的分支成员、
+  // 合成头），于是全选会在界面上看不出任何变化的情况下选中一批不可见会话——
+  // 用户只能靠「取消全选」撤销，批量归档/删除会打到自己没看见的东西。
   const selectAll = () => {
     const o = {}
-    list.forEach((x) => { o[x.sessionId] = true })
+    topList.forEach((x) => { if (x && x.sessionId != null && !x.syntheticRoot) o[x.sessionId] = true })
     setSelected(o)
   }
 
@@ -1343,15 +1409,17 @@ function SessionPanel({ workspacesSvc }) {
   const doDeleteConfirmed = () => {
     if (!delTarget || busy) return
     setBusy(delTarget.sessionId)
-    postJSON('/archived-sessions/delete', { sessionId: delTarget.sessionId })
-      .then(() => {
+    postJSON('/archived-sessions/delete', { sessionId: delTarget.sessionId, cascadeSubagents: cascadeSub })
+      .then((r) => {
         setBusy(null)
         const n = delTarget.title || delTarget.sessionId
-        showToast(`已删除 ${n}（已移入回收站）`)
-        const sid = String(delTarget.sessionId)
+        const cascaded = Number((r && r.cascaded) || 0)
+        showToast(`已删除 ${n}${cascaded ? `（连同 ${cascaded} 个子代理会话）` : ''}（已移入回收站）`)
+        const gone = new Set([String(delTarget.sessionId), ...((r && r.cascadedIds) || []).map(String)])
         setDelTarget(null)
-        // 删除进入回收站：本地移除该行 + 单刷回收站，不整表 refresh。
-        setSessions((s) => s && s.filter((x) => String(x.sessionId) !== sid))
+        // 删除进入回收站：本地移除这些行（含被连带回收的子代理）+ 单刷回收站，
+        // 不整表 refresh——refresh 会清空多选状态。
+        setSessions((s) => s && s.filter((x) => !gone.has(String(x.sessionId))))
         loadTrash()
         dsmLoadTrashIds()
       })
@@ -1430,7 +1498,10 @@ function SessionPanel({ workspacesSvc }) {
     postJSON('/archived-sessions/trash/restore', { sessionId: sid })
       .then((r) => {
         setTrashBusy(null)
-        showToast(r && r.workspaceGone ? '已恢复会话（原工作区已删除，会话暂归「未分组」）' : '已恢复会话')
+        // 子代理随父会话一起回来时如实说明，避免用户以为只恢复了一条。
+        const cascaded = Number((r && r.cascaded) || 0)
+        const base = r && r.workspaceGone ? '已恢复会话（原工作区已删除，会话暂归「未分组」）' : '已恢复会话'
+        showToast(base + (cascaded ? `，连同 ${cascaded} 个子代理会话` : ''))
         loadTrash()
         refresh()
       })
@@ -1513,7 +1584,9 @@ function SessionPanel({ workspacesSvc }) {
       .then((r) => {
         setBusy(null)
         const n = (r && (r.archived || r.restored || r.deleted)) || selIds.length
-        showToast(`已处理 ${n} 个会话`)
+        // 批量删默认也级联子代理：如实说明连带回收了多少，避免「数量对不上」。
+        const cascaded = Number((r && r.cascaded) || 0)
+        showToast(`已处理 ${n} 个会话${cascaded ? `（连同 ${cascaded} 个子代理会话）` : ''}`)
         refresh()
       })
       .catch((e) => { setBusy(null); setConfirmBatch(false); setError(String((e && e.message) || e)) })
@@ -1699,7 +1772,7 @@ function SessionPanel({ workspacesSvc }) {
               onClick={copyBuildStamp}
             >v{String(capabilities.buildStamp).split('+')[0]}</span>
           : null}
-        {sessions !== null && <span className="archv-count" aria-label={`${sessions.length} 个会话`}>{sessions.length}</span>}
+        {sessions !== null && <span className="archv-count" title={groupByLineage ? '子代理会话折叠在父会话下，不计入此数' : undefined} aria-label={`${totalTopCount} 个会话`}>{totalTopCount}</span>}
       </div>
       <p className="archv-sub">
         统一管理全部会话：归档 / 恢复 / 移动到其他工作区 / 会话详情 / 批量操作，删除会先进入回收站，可在回收站内恢复或彻底清理。
@@ -1727,7 +1800,7 @@ function SessionPanel({ workspacesSvc }) {
         <>
           <div className={'sess-fwrap' + (moreOpen ? ' sess-fmore-open' : '') + (filter === 'starred' || filter === 'empty' || filter === 'trash' ? ' sess-fsec-on' : '')}>
             <div className="sess-filter" role="tablist" aria-label="会话筛选">
-              <button type="button" role="tab" aria-selected={filter === 'all'} className={'sess-fbtn' + (filter === 'all' ? ' sess-fbtn-on' : '')} onClick={() => { setFilter('all'); clearSel(); setConfirmBatch(false) }}>全部 ({sessions.length})</button>
+              <button type="button" role="tab" aria-selected={filter === 'all'} className={'sess-fbtn' + (filter === 'all' ? ' sess-fbtn-on' : '')} onClick={() => { setFilter('all'); clearSel(); setConfirmBatch(false) }}>全部 ({totalTopCount})</button>
               <button type="button" role="tab" aria-selected={filter === 'active'} className={'sess-fbtn' + (filter === 'active' ? ' sess-fbtn-on' : '')} onClick={() => { setFilter('active'); clearSel(); setConfirmBatch(false) }}>活动 ({activeList.length})</button>
               <button type="button" role="tab" aria-selected={filter === 'archived'} className={'sess-fbtn' + (filter === 'archived' ? ' sess-fbtn-on' : '')} onClick={() => { setFilter('archived'); clearSel(); setConfirmBatch(false) }}>已归档 ({archivedList.length})</button>
               <span className="sess-fmore" role="tablist" aria-label="更多会话筛选">
@@ -1998,7 +2071,7 @@ function SessionPanel({ workspacesSvc }) {
                   {foldedCount || branchFolded
                     ? `，另有 ${[foldedCount ? `${foldedCount} 个子代理折叠在父会话下` : '', branchFolded ? `${branchFolded} 个分支聚成 ${branchGroupCount} 组` : ''].filter(Boolean).join('、')}`
                     : query || workspaceFilter !== 'all' || tagFilter
-                      ? `，共 ${filter === 'archived' ? archivedList.length : filter === 'active' ? activeList.length : filter === 'starred' ? starredList.length : filter === 'empty' ? emptyList.length : sessions.length} 个`
+                      ? `，共 ${filter === 'archived' ? archivedList.length : filter === 'active' ? activeList.length : filter === 'starred' ? starredList.length : filter === 'empty' ? emptyList.length : totalTopCount} 个`
                       : (topList.length !== list.length ? `，共 ${list.length} 个` : '')}
                 </span>
                 {/* T4：计数行右侧的保存筛选控件组。保存 = 抓 {view,workspace,
@@ -2054,10 +2127,12 @@ function SessionPanel({ workspacesSvc }) {
             </>
           )}
 
-          {showSessionList && list.length > 0 && (
+          {showSessionList && (topList.length > 0 || orphanSubagents.length > 0) && (
             <div className={'sess-batch' + (selIds.length > 0 ? ' sess-batch-pin' : '')}>
-              <span className="sess-btntext">{selIds.length ? `已选 ${selIds.length} 项` : (filter === 'archived' ? `共 ${archivedList.length} 个归档会话` : filter === 'starred' ? `共 ${starredList.length} 个收藏会话` : `共 ${sessions.length} 个会话（活动 ${activeList.length} / 已归档 ${archivedList.length}）`)}</span>
-              <button type="button" className="archv-btn" disabled={list.length === 0} onClick={selectAll}>全选</button>
+              <span className="sess-btntext">{selIds.length ? `已选 ${selIds.length} 项` : (filter === 'archived' ? `共 ${archivedList.length} 个归档会话` : filter === 'starred' ? `共 ${starredList.length} 个收藏会话` : `共 ${totalTopCount} 个会话（活动 ${activeList.length} / 已归档 ${archivedList.length}）`)}</span>
+              {/* issue #18 第 3 条：全选只覆盖当前列表里能单独勾选的行；折叠中的
+                  子代理 / 分支成员与合成头不参与，避免「选中了看不见的东西」。 */}
+              <button type="button" className="archv-btn" disabled={topList.length === 0} title={groupByLineage ? '选中当前列表的会话行（折叠中的子代理与分支成员不会被选中）' : undefined} onClick={selectAll}>全选</button>
               {selIds.length > 0 && (
                 <>
                   {filter === 'archived' && (
@@ -2137,7 +2212,7 @@ function SessionPanel({ workspacesSvc }) {
             </div>
           )}
 
-          {showSessionList && list.length === 0 ? (
+          {showSessionList && topList.length === 0 && orphanSubagents.length === 0 ? (
             <div className="archv-empty">{query || workspaceFilter !== 'all' || tagFilter ? '没有匹配的会话。请调整搜索词、标签或工作区筛选。' : filter === 'archived' ? '目前没有归档会话。在“全部”里选中会话点“归档”即可收纳进来。' : filter === 'active' ? '目前没有活动会话。' : filter === 'starred' ? '还没有收藏的会话。点击会话左侧的星标即可收藏。' : filter === 'empty' ? '没有空白会话。新开会话还没产生内容时会归到这里，侧栏会自动隐藏它们。' : '暂无可管理的会话。'}</div>
           ) : showSessionList ? (
             <div className="archv-list" role="list">
@@ -2150,18 +2225,25 @@ function SessionPanel({ workspacesSvc }) {
                   const open = !!openBranches[root] || branchHit(root)
                   const srcTitle = dsmAuthoritativeTitles.get(root)
                   return (
-                    <div key={it.sessionId} className="dsm-src-head" role="listitem">
-                      <button
-                        type="button"
-                        className="dsm-kids-toggle"
-                        aria-expanded={open}
-                        title={(open ? '收起 ' : '展开 ') + members.length + ' 个分支会话（来源会话不在当前列表）'}
-                        onClick={() => toggleBranch(root)}
-                      >
-                        {open ? '▾' : '▸'} {members.length} 分支
-                      </button>
-                      <span className="dsm-src-name" title={root}>{'来源：' + (srcTitle || shortId(root))}</span>
-                    </div>
+                    // issue #18 第 2 条：合成头先前在这里提前 return，只渲染按钮与
+                    // 「来源：」，展开时什么都不会出现（成员列表只挂在普通卡片的
+                    // renderBranchGroup 上）。这里补上同一个成员渲染器——按钮、
+                    // 展开状态、搜索命中展开都复用分支组的既有语义。
+                    <React.Fragment key={it.sessionId}>
+                      <div className="dsm-src-head" role="listitem">
+                        <button
+                          type="button"
+                          className="dsm-kids-toggle"
+                          aria-expanded={open}
+                          title={(open ? '收起 ' : '展开 ') + members.length + ' 个分支会话（来源会话不在当前列表）'}
+                          onClick={() => toggleBranch(root)}
+                        >
+                          {open ? '▾' : '▸'} {members.length} 分支
+                        </button>
+                        <span className="dsm-src-name" title={root}>{'来源：' + (srcTitle || shortId(root))}</span>
+                      </div>
+                      {renderBranchGroup(root)}
+                    </React.Fragment>
                   )
                 }
                 const date = fmtDate(it.createdAt)
@@ -2375,6 +2457,63 @@ function SessionPanel({ workspacesSvc }) {
                   </div>
                 )
               })}
+              {/* issue #18 第 1 条：父会话不在当前列表（已删除 / 已归档 / 被筛选）
+                  的子代理不再平铺成上百个「(无标题)」行，统一收进这一张卡片：
+                  默认收起不占版面，展开后逐条可打开 / 归档 / 删除，一条都不丢。 */}
+              {groupByLineage && orphanSubagents.length > 0 && (
+                <div className="archv-card dsm-orphan-card" role="listitem">
+                  <div className="archv-row">
+                    <div className="archv-body">
+                      <div className="archv-main">
+                        <div className="archv-titlerow">
+                          <button
+                            type="button"
+                            className="dsm-kids-toggle"
+                            aria-expanded={orphanOpen}
+                            title={(orphanOpen ? '收起 ' : '展开 ') + orphanSubagents.length + ' 个未归属的子代理会话'}
+                            onClick={() => setOpenOrphans(!openOrphans)}
+                          >
+                            {orphanOpen ? '▾' : '▸'} {orphanSubagents.length} 子代理
+                          </button>
+                          <span className="archv-name">未归属的子代理会话</span>
+                        </div>
+                        <div className="archv-meta">
+                          <span className="archv-wtag archv-wgone">父会话不在当前列表</span>
+                          <span className="archv-dot">·</span>
+                          <span className="archv-date">不再混进上面的会话列表；展开后可打开 / 归档 / 删除</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  {orphanOpen && (
+                    <div className="dsm-kids" aria-label="未归属子代理会话">
+                      {orphanSubagents.map((k) => {
+                        const li = lineage[String(k.sessionId)]
+                        return (
+                          <div className="dsm-kid" key={k.sessionId}>
+                            <div className="dsm-kid-row">
+                              <span className="dsm-kid-name" title={k.title || k.sessionId}>{k.title || '(无标题)'}</span>
+                              {emptyBadge(k.sessionId)}
+                              {tagChips(k.sessionId)}
+                              <span className="dsm-kid-meta">{k.archived ? '已归档' : '活动'}{fmtDate(k.createdAt) ? ` · ${fmtDate(k.createdAt)}` : ''}</span>
+                              <span className="dsm-kid-acts">
+                                <button type="button" className="archv-btn" disabled={busy !== null} title="切换到这个子代理会话（设置面板挡着会话区，关掉即可看到）" onClick={async () => {
+                                  const name = k.title || (String(k.sessionId).slice(0, 8) + '…')
+                                  const res = await dsmOpenSessionById(k.sessionId, (li && li.parentSession) || null)
+                                  const msg = openSubagentToast(res, name, 'panel')
+                                  showToast(msg.text, msg.kind)
+                                }}>打开</button>
+                                <button type="button" className="archv-btn" disabled={busy !== null} onClick={() => act(k.archived ? 'restore' : 'archive', k)}>{k.archived ? '恢复' : '归档'}</button>
+                                <button type="button" className="archv-btn archv-del" disabled={busy !== null} title="移入回收站，可在回收站恢复" onClick={() => setDelTarget(k)}>删除</button>
+                              </span>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           ) : null}
         </>
@@ -2385,6 +2524,12 @@ function SessionPanel({ workspacesSvc }) {
           <div ref={dialogRef} className="dlg" role="alertdialog" aria-modal="true" aria-label="删除会话" onClick={(e) => e.stopPropagation()}>
             <h3 className="dlg-title">删除会话</h3>
             <p className="dlg-text">确认删除「{delTarget.title || delTarget.sessionId}」？将移入回收站，可在本页底部「回收站」中恢复或彻底删除。</p>
+            {delCascadeCount > 0 && (
+              <label className="dlg-check">
+                <input type="checkbox" checked={cascadeSub} disabled={busy !== null} onChange={(e) => setCascadeSub(e.target.checked)} />
+                <span>同时删除它的 {delCascadeCount} 个子代理会话（子代理生命周期跟随父会话）。取消勾选则保留，它们会收进「未归属的子代理会话」卡片，仍可单独处理。</span>
+              </label>
+            )}
             <div className="dlg-actions">
               <button type="button" className="archv-btn" disabled={busy !== null} onClick={() => setDelTarget(null)}>取消</button>
               <button type="button" className="archv-btn archv-del" disabled={busy !== null} onClick={doDeleteConfirmed}>移入回收站</button>

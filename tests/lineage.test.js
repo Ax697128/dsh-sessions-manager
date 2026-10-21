@@ -4,7 +4,7 @@ import { Readable } from 'node:stream'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { classifyLineage, emptyScanCandidate, isEmptyLogSize, isEmptyEventTypes, EMPTY_DECODE_LIMIT } from '../src/lineage.js'
+import { classifyLineage, emptyScanCandidate, isEmptyLogSize, isEmptyEventTypes, subagentDescendantsOf, EMPTY_DECODE_LIMIT } from '../src/lineage.js'
 
 // ---- 纯函数：空白判定阈值（实测基线见 src/lineage.js 注释）------------------
 
@@ -44,6 +44,38 @@ test('isEmptyEventTypes classifies 0.1.3 lifecycle-only logs as empty', () => {
   assert.equal(isEmptyEventTypes('user/message'), false)
   // 上限常量存在且 sane（候选解码门槛）。
   assert.ok(Number.isFinite(EMPTY_DECODE_LIMIT) && EMPTY_DECODE_LIMIT >= 4096)
+})
+
+// ---- issue #18 第 5 条：插件注入上下文不算内容 -----------------------------
+// 记忆插件把 profile / 指令 splice 进下一轮 inbox（agent/inbox/spliced），
+// 界面上是一条空会话，却因为有「内容事件」永远进不了「空白」分类。
+test('isEmptyEventTypes treats plugin-injected inbox context as empty', () => {
+  const spliced = (inserted, removedCount) => ({ type: 'agent/inbox/spliced', data: { inserted, removedCount } })
+  // openviking-memory 实测形状：单条注入，source.form='instructions'。
+  assert.equal(isEmptyEventTypes([
+    { type: 'session' },
+    { type: 'permission/preset' },
+    spliced([{ source: { kind: 'plugin:openviking-memory', plugin: 'openviking-memory', form: 'instructions' } }]),
+  ]), true)
+  // 只有 plugin: 前缀、没有 form 的注入同样算噪声。
+  assert.equal(isEmptyEventTypes([spliced([{ source: { kind: 'plugin:foo' } }])]), true)
+  // 空插入 / 纯删除标记：没有任何内容留下。
+  assert.equal(isEmptyEventTypes([spliced([])]), true)
+})
+
+test('isEmptyEventTypes keeps real user messages and unknown payloads as content', () => {
+  const spliced = (inserted, removedCount) => ({ type: 'agent/inbox/spliced', data: { inserted, removedCount } })
+  // 用户自己打的消息（无 source）→ 内容，绝不能判空。
+  assert.equal(isEmptyEventTypes([spliced([{ role: 'user' }, { role: 'user', source: null }])]), false)
+  // 混合：真用户消息 + 注入 → 内容。
+  assert.equal(isEmptyEventTypes([
+    spliced([{ source: { kind: 'plugin:x', form: 'instructions' } }, { role: 'user' }]),
+  ]), false)
+  // 删过消息说明原本有内容。
+  assert.equal(isEmptyEventTypes([spliced([], 2)]), false)
+  // 载荷缺失/畸形一律按内容处理（保守方向）。
+  assert.equal(isEmptyEventTypes([{ type: 'agent/inbox/spliced' }]), false)
+  assert.equal(isEmptyEventTypes([{ type: 'agent/inbox/spliced', data: { inserted: 'nope' } }]), false)
 })
 
 // ---- 纯函数：血缘分类 ------------------------------------------------------
@@ -249,4 +281,59 @@ test('lineage-tree flags sessions live from ctx.sessions and guards missing para
   } finally {
     liveList.length = 0
   }
+})
+
+// ---- issue #18 第 4 条：子代理级联删除的后代收集 ---------------------------
+// 删除父会话时按官方 header 的 origin/parentSession 收集整棵子树；分叉（fork）
+// 分支不是子代理，生命周期独立，绝不能被父会话的删除带走。
+test('subagentDescendantsOf walks the whole subagent subtree', () => {
+  const headers = [
+    { id: 'p' },
+    { id: 'a', origin: 'subagent', parentSession: 'p' },
+    { id: 'b', origin: 'subagent', parentSession: 'p' },
+    { id: 'c', origin: 'subagent', parentSession: 'a', delegationDepth: 2 },
+    { id: 'd', origin: 'subagent', parentSession: 'c', delegationDepth: 3 },
+  ]
+  assert.deepEqual(subagentDescendantsOf(headers, 'p'), ['a', 'b', 'c', 'd'])
+  // 从中间节点算起：只拿它下面的子树。
+  assert.deepEqual(subagentDescendantsOf(headers, 'a'), ['c', 'd'])
+  // 叶子没有后代。
+  assert.deepEqual(subagentDescendantsOf(headers, 'd'), [])
+})
+
+test('subagentDescendantsOf leaves fork branches and unrelated sessions alone', () => {
+  const headers = [
+    { id: 'p' },
+    // 分叉分支：有 parentSession 但 origin 不是 subagent → 独立会话，不能删。
+    { id: 'fork', parentSession: 'p' },
+    { id: 'other' },
+    { id: 'kid', origin: 'subagent', parentSession: 'p' },
+  ]
+  assert.deepEqual(subagentDescendantsOf(headers, 'p'), ['kid'])
+})
+
+test('subagentDescendantsOf tolerates malformed headers, self-parents and cycles', () => {
+  const headers = [
+    { id: 'p' },
+    { id: 'self', origin: 'subagent', parentSession: 'self' },
+    { id: 'noparent', origin: 'subagent' },
+    { id: 'a', origin: 'subagent', parentSession: 'p' },
+    { id: 'b', origin: 'subagent', parentSession: 'a' },
+    // a/b 互相指也不影响：visited 已挡住重复。
+    null, 'nope', { origin: 'subagent' }, { id: 'c', origin: 'subagent', parentSession: 'b' },
+  ]
+  assert.deepEqual(subagentDescendantsOf(headers, 'p'), ['a', 'b', 'c'])
+  // 非法输入：一律空数组，绝不抛错（删除路径不能被血缘数据拖垮）。
+  assert.deepEqual(subagentDescendantsOf(null, 'p'), [])
+  assert.deepEqual(subagentDescendantsOf(headers, ''), [])
+  assert.deepEqual(subagentDescendantsOf(headers, null), [])
+})
+
+test('subagentDescendantsOf caps pathological trees', () => {
+  const headers = [{ id: 'p' }]
+  for (let i = 0; i < 10; i++) headers.push({ id: 'k' + i, origin: 'subagent', parentSession: 'p' })
+  assert.equal(subagentDescendantsOf(headers, 'p', 4).length, 4)
+  // 0 / 负数 / NaN 一律回落到默认上限，不会变成「不删任何后代」。
+  assert.equal(subagentDescendantsOf(headers, 'p', 0).length, 10)
+  assert.equal(subagentDescendantsOf(headers, 'p', -5).length, 10)
 })
